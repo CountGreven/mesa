@@ -39,6 +39,9 @@
 #include "pan_pool.h"
 #include "pan_precomp.h"
 #include "libpan_copy.h"
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+#include "draw_helper.h"
+#endif
 #include "pan_resource.h"
 #include "pan_samples.h"
 #include "pan_shader.h"
@@ -2331,10 +2334,19 @@ panfrost_emit_vertex_data(struct panfrost_batch *batch, uint64_t *buffers)
 #endif
    unsigned nr_images = util_last_bit(image_mask);
 
+   /* GPU-driven draws (Bifrost JM): the draw helper rewrites buffer i in
+    * place at records 2*i/2*i+1, whatever the instancing ends up being.
+    */
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+   const bool gpu_draw = ctx->gpu_draw;
+#else
+   const bool gpu_draw = false;
+#endif
+
    /* Worst case: everything is NPOT, which is only possible if instancing
     * is enabled. Otherwise single record is guaranteed. */
    unsigned attrib_bufs =
-      instanced ? so->nr_bufs * 2 : ALIGN_POT(so->nr_bufs, 2);
+      (instanced || gpu_draw) ? so->nr_bufs * 2 : ALIGN_POT(so->nr_bufs, 2);
    /* Images always use two buffer descriptors. */
    unsigned nr_bufs =
       attrib_bufs + (nr_images * 2) + nr_texbuf + (PAN_ARCH >= 6 ? 1 : 0);
@@ -2375,9 +2387,44 @@ panfrost_emit_vertex_data(struct panfrost_batch *batch, uint64_t *buffers)
    unsigned attrib_to_buffer[PIPE_MAX_ATTRIBS] = {0};
    unsigned k = 0;
 
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+   struct libpan_draw_helper_attrib_buf_info *gpu_buf_infos = NULL;
+   struct libpan_draw_helper_attrib_info *gpu_attrib_infos = NULL;
+   uint32_t gpu_bufs_valid = 0, gpu_attribs_valid = 0;
+
+   if (gpu_draw) {
+      struct pan_ptr bi = pan_pool_alloc_aligned(
+         &batch->pool.base,
+         MAX2(so->nr_bufs, 1) * sizeof(*gpu_buf_infos), 8);
+      struct pan_ptr ai = pan_pool_alloc_aligned(
+         &batch->pool.base,
+         MAX2(vs->info.attributes_read_count, 1) * sizeof(*gpu_attrib_infos),
+         8);
+
+      if (!bi.cpu || !ai.cpu) {
+         *buffers = 0;
+         return 0;
+      }
+
+      gpu_buf_infos = bi.cpu;
+      gpu_attrib_infos = ai.cpu;
+      batch->gpu_draw.attrib_bufs_infos = bi.gpu;
+      batch->gpu_draw.attribs_infos = ai.gpu;
+   }
+#endif
+
    for (unsigned i = 0; i < so->nr_bufs; ++i) {
       unsigned vbi = so->buffers[i].vbi;
       unsigned divisor = so->buffers[i].divisor;
+
+      if (gpu_draw) {
+         /* Unbound buffers get an empty record so nothing is read. */
+         k = i * 2;
+         pan_pack(bufs + k, ATTRIBUTE_BUFFER, cfg)
+            ;
+         memset(bufs + k + 1, 0, sizeof(*bufs));
+      }
+
       attrib_to_buffer[i] = k;
 
       if (!(ctx->vb_mask & (1 << vbi)))
@@ -2405,6 +2452,26 @@ panfrost_emit_vertex_data(struct panfrost_batch *batch, uint64_t *buffers)
        * the product of the instance divisor and the padded count */
       unsigned stride = so->strides[vbi];
       unsigned hw_divisor = ctx->padded_count * divisor;
+
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+      if (gpu_draw) {
+         /* Only pointer and size are kept by the draw helper, which picks
+          * the record type and divisor once the counts are known.
+          */
+         pan_pack(bufs + k, ATTRIBUTE_BUFFER, cfg) {
+            cfg.pointer = addr;
+            cfg.size = size;
+         }
+
+         gpu_buf_infos[i] = (struct libpan_draw_helper_attrib_buf_info){
+            .divisor = divisor,
+            .stride = stride,
+            .per_instance = divisor != 0,
+         };
+         gpu_bufs_valid |= BITFIELD_BIT(i);
+         continue;
+      }
+#endif
 
       if (ctx->instance_count <= 1) {
          /* Per-instance would be every attribute equal */
@@ -2464,6 +2531,9 @@ panfrost_emit_vertex_data(struct panfrost_batch *batch, uint64_t *buffers)
 
       ++k;
    }
+
+   if (gpu_draw)
+      k = so->nr_bufs * 2;
 
 #if PAN_ARCH <= 5
    /* Add special gl_VertexID/gl_InstanceID buffers */
@@ -2549,12 +2619,45 @@ panfrost_emit_vertex_data(struct panfrost_batch *batch, uint64_t *buffers)
       if (so->pipe[i].instance_divisor && ctx->instance_count > 1)
          src_offset -= so->pipe[i].src_stride * ctx->offset_start;
 
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+      if (gpu_draw) {
+         unsigned b = so->element_buffer[i];
+         bool per_instance = so->pipe[i].instance_divisor != 0;
+         unsigned inst_stride = per_instance ? so->pipe[i].src_stride : 0;
+
+         /* base_instance and offset_start are applied by the draw helper.
+          * Note it offsets per-instance data by base_instance * stride, as
+          * the spec says, where the CPU path divides by the divisor.
+          */
+         pan_pack(out + i, ATTRIBUTE, cfg) {
+            cfg.buffer_index = attrib_to_buffer[b];
+            cfg.format = so->formats[i];
+            cfg.offset = so->pipe[i].src_offset + (buf->buffer_offset & 63);
+         }
+
+         gpu_attrib_infos[i] = (struct libpan_draw_helper_attrib_info){
+            .base_offset = so->pipe[i].src_offset + (buf->buffer_offset & 63),
+            .stride = inst_stride,
+            .instanced_offset_start_stride = inst_stride,
+         };
+
+         if (gpu_bufs_valid & BITFIELD_BIT(b))
+            gpu_attribs_valid |= BITFIELD_BIT(i);
+         continue;
+      }
+#endif
+
       pan_pack(out + i, ATTRIBUTE, cfg) {
          cfg.buffer_index = attrib_to_buffer[so->element_buffer[i]];
          cfg.format = so->formats[i];
          cfg.offset = src_offset;
       }
    }
+
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+   batch->gpu_draw.attrib_bufs_valid = gpu_bufs_valid;
+   batch->gpu_draw.attribs_valid = gpu_attribs_valid;
+#endif
 
    *buffers = S.gpu;
    return T.gpu;
@@ -2885,6 +2988,46 @@ panfrost_bi_emit_varying_descriptor(struct panfrost_batch *batch,
    }
 
    unsigned present = linkage->present, stride = linkage->stride;
+
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+   if (ctx->gpu_draw) {
+      /* The draw helper sizes the general, position and point size buffers
+       * from the GPU-known counts and carves them out of the batch varying
+       * heap. Emit the three of them (point size with a zero stride when
+       * absent, which allocates nothing) with strides only, then the null
+       * record that stops prefetching.
+       */
+      STATIC_ASSERT((int)PANLIB_VARY_BUF_GENERAL == (int)PAN_VARY_GENERAL);
+      STATIC_ASSERT((int)PANLIB_VARY_BUF_POSITION == (int)PAN_VARY_POSITION);
+      STATIC_ASSERT((int)PANLIB_VARY_BUF_PSIZ == (int)PAN_VARY_PSIZ);
+      assert(!(present & ~BITFIELD_MASK(PAN_VARY_PSIZ + 1)));
+
+      struct pan_ptr T = pan_pool_alloc_desc_array(
+         &batch->pool.base, PANLIB_VARY_BUF_MAX + 1, ATTRIBUTE_BUFFER);
+
+      if (!T.cpu) {
+         mesa_loge("panfrost_emit_varying_descriptor failed");
+         return;
+      }
+
+      struct mali_attribute_buffer_packed *bufs = T.cpu;
+
+      pan_pack(&bufs[PANLIB_VARY_BUF_GENERAL], ATTRIBUTE_BUFFER, cfg)
+         cfg.stride = stride;
+      pan_pack(&bufs[PANLIB_VARY_BUF_POSITION], ATTRIBUTE_BUFFER, cfg)
+         cfg.stride = sizeof(float) * 4;
+      pan_pack(&bufs[PANLIB_VARY_BUF_PSIZ], ATTRIBUTE_BUFFER, cfg)
+         cfg.stride = (present & BITFIELD_BIT(PAN_VARY_PSIZ)) ? 2 : 0;
+      memset(&bufs[PANLIB_VARY_BUF_MAX], 0, sizeof(*bufs));
+
+      batch->varyings.nr_bufs = PANLIB_VARY_BUF_MAX;
+      batch->varyings.bufs = T.gpu;
+      batch->varyings.vs = linkage->producer;
+      batch->varyings.fs = linkage->consumer;
+      return;
+   }
+#endif
+
    unsigned count = util_bitcount(present);
    struct pan_ptr T =
       pan_pool_alloc_desc_array(&batch->pool.base, count + 1, ATTRIBUTE_BUFFER);

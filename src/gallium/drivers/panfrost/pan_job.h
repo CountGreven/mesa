@@ -132,6 +132,17 @@ struct panfrost_batch {
     */
    uint64_t vertex_offsets_sysval[3];
 
+   /* Per-draw inputs of the draw helper kernel when ctx->gpu_draw is set:
+    * arrays of struct libpan_draw_helper_attrib_buf_info and
+    * struct libpan_draw_helper_attrib_info, and which entries are valid.
+    */
+   struct {
+      uint64_t attrib_bufs_infos;
+      uint64_t attribs_infos;
+      uint32_t attrib_bufs_valid;
+      uint32_t attribs_valid;
+   } gpu_draw;
+
    /* Cached descriptors */
    uint64_t viewport;
    uint64_t rsd[MESA_SHADER_STAGES];

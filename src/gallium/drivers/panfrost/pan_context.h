@@ -180,6 +180,12 @@ struct panfrost_context {
     * it is disabled, just equal to plain vertex count */
    unsigned padded_count;
 
+   /* Set while emitting a Bifrost JM draw whose vertex/instance counts are
+    * only known on the GPU. Descriptors depending on them are emitted as
+    * templates, completed by the libpan draw helper kernel.
+    */
+   bool gpu_draw;
+
    struct panfrost_constant_buffer constant_buffer[MESA_SHADER_STAGES];
    struct panfrost_rasterizer *rasterizer;
    struct panfrost_vertex_state *vertex;
