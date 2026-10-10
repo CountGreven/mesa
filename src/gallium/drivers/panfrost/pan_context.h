@@ -165,6 +165,9 @@ struct panfrost_context {
    bool active_queries;
    uint64_t prims_generated;
    uint64_t tf_prims_generated;
+   /* Number of running PRIMITIVES_GENERATED/EMITTED queries, which count
+    * primitives on the CPU and so need CPU-known draw counts. */
+   unsigned prim_queries_active;
    uint64_t draw_calls;
    struct panfrost_query *occlusion_query;
 
