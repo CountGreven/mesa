@@ -1146,7 +1146,7 @@ jm_add_gpu_draw_jobs(struct panfrost_batch *batch, unsigned helper_job,
  * emitted with ctx->gpu_draw set. Everything goes in this batch's own
  * vertex/tiler chain:
  *
- *   [WRITE_VALUE min/max seed] -> [min/max search] -> draw helper
+ *   [min/max search, CPU-seeded] -> draw helper
  *      -> vertex -> tiler   (or -> IDVS)
  *
  * The helper patches the job headers (NULL for empty draws), invocations,
@@ -1182,24 +1182,20 @@ GENX(jm_launch_draw_gpu)(struct panfrost_batch *batch,
       struct pan_ptr res = pan_pool_alloc_aligned(
          &batch->pool.base,
          sizeof(struct libpan_draw_helper_index_min_max_result), 8);
-      struct pan_ptr seed =
-         pan_pool_alloc_desc(&batch->pool.base, WRITE_VALUE_JOB);
 
-      if (!res.cpu || !seed.cpu) {
+      if (!res.cpu) {
          mesa_loge("jm_launch_draw_gpu failed");
          return;
       }
 
-      /* min = largest index value, max = 0 */
-      pan_section_pack(seed.cpu, WRITE_VALUE_JOB, PAYLOAD, cfg) {
-         cfg.type = MALI_WRITE_VALUE_TYPE_IMMEDIATE_64;
-         cfg.address = res.gpu;
-         cfg.immediate_value = BITFIELD64_MASK(info->index_size * 8);
-      }
-
-      unsigned seed_job = pan_jc_add_job(jc, MALI_JOB_TYPE_WRITE_VALUE,
-                                         barrier, false, 0, 0, &seed, false);
-      barrier = false;
+      /* min = largest index value, max = 0. The batch pool is written
+       * before the batch is submitted, and only once, so no job is needed.
+       */
+      *(struct libpan_draw_helper_index_min_max_result *)res.cpu =
+         (struct libpan_draw_helper_index_min_max_result){
+            .min = BITFIELD_MASK(info->index_size * 8),
+            .max = 0,
+         };
 
       /* 64 threads per workgroup, 1024 indices per thread. */
       unsigned wg_count = DIV_ROUND_UP(MAX2(max_index_count, 1), 65536);
@@ -1215,11 +1211,12 @@ GENX(jm_launch_draw_gpu)(struct panfrost_batch *batch,
                              max),
       };
       panlib_draw_index_minmax_search_helper_struct(
-         batch, panlib_1d_with_jm_deps(wg_count, seed_job, 0),
-         PANLIB_BARRIER_NONE, args, util_logbase2(info->index_size),
-         info->primitive_restart);
+         batch, panlib_1d_with_jm_deps(wg_count, 0, 0),
+         barrier ? PANLIB_BARRIER_JM_BARRIER : PANLIB_BARRIER_NONE, args,
+         util_logbase2(info->index_size), info->primitive_restart);
 
       helper_dep = jc->job_index;
+      barrier = false;
       minmax = res.gpu;
    }
 
