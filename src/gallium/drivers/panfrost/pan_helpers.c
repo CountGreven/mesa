@@ -127,6 +127,11 @@ panfrost_get_index_buffer_bounded(struct panfrost_batch *batch,
       *max_index = info->max_index;
       needs_indices = false;
    } else if (!info->has_user_indices) {
+      /* GL buffers are often created without PIPE_BIND_INDEX_BUFFER and only
+       * later bound as index buffers, so allocate the cache on first use. */
+      if (!rsrc->index_cache)
+         rsrc->index_cache = CALLOC_STRUCT(pan_minmax_cache);
+
       /* Check the cache */
       needs_indices =
          !pan_minmax_cache_get(rsrc->index_cache, info->index_size, draw->start,
