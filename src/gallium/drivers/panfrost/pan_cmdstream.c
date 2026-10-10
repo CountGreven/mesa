@@ -1413,6 +1413,10 @@ panfrost_upload_sysvals(struct panfrost_batch *batch, void *ptr_cpu,
          break;
 #endif
       case PAN_SYSVAL_VERTEX_INSTANCE_OFFSETS:
+         for (unsigned j = 0; j < 3; j++) {
+            batch->vertex_offsets_sysval[j] =
+               ptr_gpu + (i * sizeof(*uniforms)) + (j * 4);
+         }
          uniforms[i].u[0] = batch->ctx->offset_start;
          uniforms[i].u[1] = batch->ctx->base_vertex;
          uniforms[i].u[2] = batch->ctx->base_instance;
@@ -1608,6 +1612,10 @@ panfrost_emit_const_buf(struct panfrost_batch *batch,
          if (sysval_type == PAN_SYSVAL_NUM_WORK_GROUPS &&
              sysval_comp < ARRAY_SIZE(batch->num_wg_sysval))
             batch->num_wg_sysval[sysval_comp] = ptr;
+
+         if (sysval_type == PAN_SYSVAL_VERTEX_INSTANCE_OFFSETS &&
+             sysval_comp < ARRAY_SIZE(batch->vertex_offsets_sysval))
+            batch->vertex_offsets_sysval[sysval_comp] = ptr;
       }
 
       /* Grab the mapped memory. We only do this path for sysvals & user

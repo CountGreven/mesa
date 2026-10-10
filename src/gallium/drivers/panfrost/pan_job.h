@@ -126,6 +126,12 @@ struct panfrost_batch {
    /* Keep the num_work_groups sysval around for indirect dispatch */
    uint64_t num_wg_sysval[3];
 
+   /* Address of the {raw vertex offset, base vertex, base instance} sysval
+    * words of the last emitted vertex constant buffer, or 0 when the shader
+    * does not read them. Patched by the GPU on GPU-driven draws.
+    */
+   uint64_t vertex_offsets_sysval[3];
+
    /* Cached descriptors */
    uint64_t viewport;
    uint64_t rsd[MESA_SHADER_STAGES];
