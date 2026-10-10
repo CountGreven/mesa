@@ -17,6 +17,7 @@
 #include "pan_precomp.h"
 #include "pan_trace.h"
 #include "kmod/panfrost_kmod.h"
+#include "poly/geometry.h"
 
 #if PAN_ARCH >= 10
 #error "JM helpers are only used for gen < 10"
@@ -1023,6 +1024,44 @@ GENX(jm_launch_draw)(struct panfrost_batch *batch,
    }
 #endif
 }
+
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+/* Size of the per-batch varying heap used by GPU-driven draws. The BO is
+ * growable, so this is only address space: pages are faulted in as the draw
+ * helper allocates, and the BO cache recycles them across batches. A
+ * per-batch heap (rather than a device-wide one reset per batch, as PanVK
+ * does) keeps the vertex/tiler work of the next batch from overwriting
+ * varyings the previous batch's fragment job is still reading.
+ */
+#define PAN_JM_POLY_HEAP_SIZE (256u * 1024 * 1024)
+
+uint64_t
+GENX(jm_get_poly_heap)(struct panfrost_batch *batch)
+{
+   if (batch->jm.poly_heap)
+      return batch->jm.poly_heap;
+
+   struct panfrost_bo *bo = panfrost_batch_create_bo(
+      batch, PAN_JM_POLY_HEAP_SIZE, PAN_BO_INVISIBLE | PAN_BO_GROWABLE,
+      MESA_SHADER_VERTEX, "Draw helper varying heap");
+   if (!bo)
+      return 0;
+
+   struct pan_ptr state =
+      pan_pool_alloc_aligned(&batch->pool.base, sizeof(struct poly_heap), 16);
+   if (!state.cpu)
+      return 0;
+
+   *(struct poly_heap *)state.cpu = (struct poly_heap){
+      .base = bo->ptr.gpu,
+      .bottom = 0,
+      .size = PAN_JM_POLY_HEAP_SIZE,
+   };
+
+   batch->jm.poly_heap = state.gpu;
+   return state.gpu;
+}
+#endif
 
 void
 GENX(jm_launch_draw_indirect)(struct panfrost_batch *batch,

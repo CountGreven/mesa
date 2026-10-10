@@ -21,6 +21,16 @@ struct panfrost_jm_batch {
       /* Fragment job, only one per batch. */
       uint64_t frag;
    } jobs;
+
+   /* Bifrost GPU-driven draws: struct poly_heap living in the batch pool and
+    * pointing to a growable BO owned by the batch. Varyings of GPU-sized draws
+    * are allocated from it by the draw helper kernel, so it must stay alive
+    * until the fragment job of this batch is done. 0 until first use.
+    */
+   uint64_t poly_heap;
+
+   /* Number of GPU-driven draws in the batch. */
+   uint32_t gpu_draw_count;
 };
 
 #if defined(PAN_ARCH) && PAN_ARCH < 10
@@ -80,6 +90,10 @@ void GENX(jm_launch_draw_indirect)(struct panfrost_batch *batch,
 void GENX(jm_launch_draw_fullscreen)(struct panfrost_batch *batch,
                                      enum blitter_attrib_type type,
                                      const struct blitter_attrib *attrib);
+
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+uint64_t GENX(jm_get_poly_heap)(struct panfrost_batch *batch);
+#endif
 
 void GENX(jm_emit_write_timestamp)(struct panfrost_batch *batch,
                                    struct panfrost_resource *dst,
