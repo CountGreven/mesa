@@ -1074,6 +1074,70 @@ sysval_or_sink(uint64_t addr)
    return addr ? addr : PAN_JM_MEMORY_SINK;
 }
 
+/* Allocate the vertex/tiler (or IDVS) jobs of a GPU-driven draw and emit
+ * them as templates: counts, offsets and the index pointer are patched later
+ * by the draw helper. vertex is zeroed for IDVS.
+ */
+static bool
+jm_emit_gpu_draw_templates(struct panfrost_batch *batch,
+                           const struct pipe_draw_info *info,
+                           struct pan_ptr *vertex, struct pan_ptr *tiler)
+{
+   struct panfrost_compiled_shader *vs = batch->ctx->prog[MESA_SHADER_VERTEX];
+   bool secondary_shader = vs->info.vs.secondary_enable;
+   bool idvs = vs->info.vs.idvs;
+
+   *vertex = (struct pan_ptr){0};
+
+   if (idvs) {
+      *tiler = pan_pool_alloc_desc(&batch->pool.base, INDEXED_VERTEX_JOB);
+   } else {
+      *vertex = pan_pool_alloc_desc(&batch->pool.base, COMPUTE_JOB);
+      *tiler = pan_pool_alloc_desc(&batch->pool.base, TILER_JOB);
+   }
+
+   if ((!idvs && !vertex->cpu) || !tiler->cpu)
+      return false;
+
+   struct mali_invocation_packed invocation;
+   pan_pack_work_groups_compute(&invocation, 1, 1, 1, 1, 1, 1, true, false);
+   const struct pipe_draw_start_count_bias draw = {0};
+
+   jm_emit_tiler_job(batch, info, &draw, &invocation, secondary_shader,
+                     tiler->cpu);
+
+   if (idvs) {
+      jm_emit_vertex_draw(
+         batch, pan_section_ptr(tiler->cpu, INDEXED_VERTEX_JOB, VERTEX_DRAW));
+   } else {
+      jm_emit_vertex_job(batch, info, &invocation, vertex->cpu);
+   }
+
+   return true;
+}
+
+/* Queue the jobs of a GPU-driven draw behind its helper job. Tiling jobs get
+ * their dependency_2 forced to the previous tiling job, so the dependency on
+ * the helper must go in dependency_1.
+ */
+static void
+jm_add_gpu_draw_jobs(struct panfrost_batch *batch, unsigned helper_job,
+                     struct pan_ptr *vertex, struct pan_ptr *tiler)
+{
+   struct pan_jc *jc = &batch->jm.jobs.vtc_jc;
+
+   if (!vertex->cpu) {
+      pan_jc_add_job(jc, MALI_JOB_TYPE_INDEXED_VERTEX, false, false,
+                     helper_job, 0, tiler, false);
+   } else {
+      unsigned vertex_job = pan_jc_add_job(jc, MALI_JOB_TYPE_VERTEX, false,
+                                           true, helper_job, 0, vertex,
+                                           false);
+      pan_jc_add_job(jc, MALI_JOB_TYPE_TILER, false, false, vertex_job, 0,
+                     tiler, false);
+   }
+}
+
 /*
  * Emit a draw whose vertex/index count, instance count, first vertex/index,
  * base vertex and base instance are read by the GPU from a
@@ -1101,37 +1165,14 @@ GENX(jm_launch_draw_gpu)(struct panfrost_batch *batch,
    struct panfrost_context *ctx = batch->ctx;
    struct panfrost_compiled_shader *vs = ctx->prog[MESA_SHADER_VERTEX];
    struct pan_jc *jc = &batch->jm.jobs.vtc_jc;
-   bool secondary_shader = vs->info.vs.secondary_enable;
    bool idvs = vs->info.vs.idvs;
 
    uint64_t heap = GENX(jm_get_poly_heap)(batch);
-   struct pan_ptr tiler, vertex = {0};
+   struct pan_ptr tiler, vertex;
 
-   if (idvs) {
-      tiler = pan_pool_alloc_desc(&batch->pool.base, INDEXED_VERTEX_JOB);
-   } else {
-      vertex = pan_pool_alloc_desc(&batch->pool.base, COMPUTE_JOB);
-      tiler = pan_pool_alloc_desc(&batch->pool.base, TILER_JOB);
-   }
-
-   if (!heap || (!idvs && !vertex.cpu) || !tiler.cpu) {
+   if (!heap || !jm_emit_gpu_draw_templates(batch, info, &vertex, &tiler)) {
       mesa_loge("jm_launch_draw_gpu failed");
       return;
-   }
-
-   /* Templates: counts, offsets and the index pointer are patched later. */
-   struct mali_invocation_packed invocation;
-   pan_pack_work_groups_compute(&invocation, 1, 1, 1, 1, 1, 1, true, false);
-   const struct pipe_draw_start_count_bias draw = {0};
-
-   jm_emit_tiler_job(batch, info, &draw, &invocation, secondary_shader,
-                     tiler.cpu);
-
-   if (idvs) {
-      jm_emit_vertex_draw(
-         batch, pan_section_ptr(tiler.cpu, INDEXED_VERTEX_JOB, VERTEX_DRAW));
-   } else {
-      jm_emit_vertex_job(batch, info, &invocation, vertex.cpu);
    }
 
    unsigned helper_dep = 0;
@@ -1248,21 +1289,7 @@ GENX(jm_launch_draw_gpu)(struct panfrost_batch *batch,
       panlib_draw_indirect_helper_struct(batch, grid, helper_barrier, args);
    }
 
-   unsigned helper_job = jc->job_index;
-
-   /* Tiling jobs get their dependency_2 forced to the previous tiling job,
-    * so the dependency on the helper must go in dependency_1.
-    */
-   if (idvs) {
-      pan_jc_add_job(jc, MALI_JOB_TYPE_INDEXED_VERTEX, false, false,
-                     helper_job, 0, &tiler, false);
-   } else {
-      unsigned vertex_job = pan_jc_add_job(jc, MALI_JOB_TYPE_VERTEX, false,
-                                           true, helper_job, 0, &vertex,
-                                           false);
-      pan_jc_add_job(jc, MALI_JOB_TYPE_TILER, false, false, vertex_job, 0,
-                     &tiler, false);
-   }
+   jm_add_gpu_draw_jobs(batch, jc->job_index, &vertex, &tiler);
 
    batch->jm.gpu_draw_count++;
 }
