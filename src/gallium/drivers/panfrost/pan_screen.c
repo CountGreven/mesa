@@ -885,7 +885,12 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
 
    caps->draw_indirect = true;
 
-   caps->multi_draw_indirect = dev->arch >= 10;
+   /* On Bifrost JM, multi-draws are only cheaper than the frontend's split
+    * when they are resolved on the GPU with batched draw helpers.
+    */
+   caps->multi_draw_indirect =
+      dev->arch >= 10 ||
+      ((dev->arch == 6 || dev->arch == 7) && (dev->debug & PAN_DBG_GPU_DRAWS));
 
    caps->start_instance =
    caps->draw_parameters = pan_is_bifrost(dev);
