@@ -3570,6 +3570,74 @@ panfrost_draw_get_vertex_count(struct panfrost_batch *batch,
    return vertex_count;
 }
 
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+static bool panfrost_gpu_draw_supported(struct panfrost_context *ctx,
+                                        const struct pipe_draw_info *info);
+static void panfrost_gpu_draw(struct panfrost_batch *batch,
+                              const struct pipe_draw_info *info,
+                              unsigned drawid_offset, uint64_t cmd,
+                              unsigned max_index_count, bool barrier);
+
+/*
+ * Direct indexed draws need the index bounds to size varyings. The CPU scan
+ * is free when the bounds are cached and cheap when the buffer is idle, but
+ * when the GPU may still be using the buffer (streamed index data, buffers
+ * reused every frame), mapping it waits for that work and serialises CPU and
+ * GPU. Only then, search the bounds on the GPU instead.
+ */
+static bool
+panfrost_draw_wants_gpu_index_bounds(struct panfrost_batch *batch,
+                                     const struct pipe_draw_info *info,
+                                     const struct pipe_draw_start_count_bias *draw)
+{
+   struct panfrost_context *ctx = batch->ctx;
+
+   if (!info->index_size || info->has_user_indices ||
+       info->index_bounds_valid ||
+       batch->jm.gpu_draw_count >= PAN_JM_MAX_GPU_DRAWS_PER_BATCH ||
+       !panfrost_gpu_draw_supported(ctx, info))
+      return false;
+
+   struct panfrost_resource *rsrc = pan_resource(info->index.resource);
+   unsigned min_index, max_index;
+
+   if (pan_minmax_cache_get(rsrc->index_cache, info->index_size, draw->start,
+                            draw->count, &min_index, &max_index))
+      return false;
+
+   return panfrost_any_batch_writes_rsrc(ctx, rsrc) ||
+          !panfrost_bo_wait(rsrc->bo, 0, false);
+}
+
+static void
+panfrost_draw_direct_gpu_bounds(struct panfrost_batch *batch,
+                                const struct pipe_draw_info *info,
+                                unsigned drawid_offset,
+                                const struct pipe_draw_start_count_bias *draw)
+{
+   perf_debug(batch->ctx, "Searching index bounds on the GPU");
+
+   /* Same layout as DrawElementsIndirectCommand */
+   const uint32_t cmd[5] = {
+      draw->count, info->instance_count, draw->start, draw->index_bias,
+      info->start_instance,
+   };
+   struct pan_ptr T = pan_pool_alloc_aligned(&batch->pool.base, sizeof(cmd), 4);
+   if (!T.cpu) {
+      mesa_loge("panfrost_draw_direct_gpu_bounds failed");
+      return;
+   }
+   memcpy(T.cpu, cmd, sizeof(cmd));
+
+   struct panfrost_resource *index_buf = pan_resource(info->index.resource);
+   panfrost_batch_read_rsrc(batch, index_buf);
+
+   /* The search covers exactly the drawn range. */
+   panfrost_gpu_draw(batch, info, drawid_offset, T.gpu, draw->count,
+                     panfrost_batch_writes_rsrc(batch, index_buf));
+}
+#endif
+
 static void
 panfrost_single_draw_direct(struct panfrost_batch *batch,
                             const struct pipe_draw_info *info,
@@ -3580,6 +3648,13 @@ panfrost_single_draw_direct(struct panfrost_batch *batch,
       return;
 
    struct panfrost_context *ctx = batch->ctx;
+
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+   if (panfrost_draw_wants_gpu_index_bounds(batch, info, draw)) {
+      panfrost_draw_direct_gpu_bounds(batch, info, drawid_offset, draw);
+      return;
+   }
+#endif
 
    panfrost_update_active_prim(ctx, info->mode);
 
