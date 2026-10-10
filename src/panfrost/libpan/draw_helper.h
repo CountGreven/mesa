@@ -37,5 +37,10 @@ struct libpan_draw_helper_attrib_info {
 
     /* When the attribute is per instance, the stride otherwise 0 */
     uint32_t stride;
+
+    /* For instanced draws, subtract raw_vertex_offset times this from the
+     * offset. Gallium compensates per-instance attributes for the offset_start
+     * the hardware applies; PanVK leaves this at 0. */
+    uint32_t instanced_offset_start_stride;
 };
 #endif

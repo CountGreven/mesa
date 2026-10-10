@@ -583,6 +583,7 @@ panvk_draw_emit_attrib(const struct panvk_draw_data *draw,
       if (helper_attrib_info != NULL) {
          helper_attrib_info->base_offset = offset;
          helper_attrib_info->stride = per_instance ? buf_info->stride : 0;
+         helper_attrib_info->instanced_offset_start_stride = 0;
       } else {
          cfg.offset = offset;
          if (per_instance)
