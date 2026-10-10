@@ -614,6 +614,142 @@ panlib_draw_indexed_indirect_helper(
                                first_instance_sysval, raw_vertex_offset_sysval);
 }
 
+/* Descriptor pointers of one draw of a multi-draw, as recorded by the CPU. */
+static struct panlib_draw_info
+panlib_multi_draw_info(global struct libpan_draw_helper_multi_draw *d,
+                       global struct poly_heap *heap,
+                       uint32_t primitive_vertex_count)
+{
+   return (struct panlib_draw_info){
+      .idvs_job = (global uint8_t *)d->idvs_job,
+      .vertex_job = (global uint8_t *)d->vertex_job,
+      .tiler_job = (global uint8_t *)d->tiler_job,
+
+      .varying_bufs.descs =
+         (global struct mali_attribute_buffer_packed *)d->varying_bufs_descs,
+
+      .attrib_bufs.descs =
+         (global struct mali_attribute_buffer_packed *)d->attrib_bufs_descs,
+      .attrib_bufs.infos =
+         (global struct libpan_draw_helper_attrib_buf_info *)
+            d->attrib_bufs_infos,
+      .attrib_bufs.valid = d->attrib_bufs_valid,
+
+      .attribs.descs = (global struct mali_attribute_packed *)d->attribs_descs,
+      .attribs.infos =
+         (global struct libpan_draw_helper_attrib_info *)d->attribs_infos,
+      .attribs.valid = d->attribs_valid,
+
+      .primitive_vertex_count = primitive_vertex_count,
+
+      .heap = heap,
+   };
+}
+
+/* One lane per draw of a multi-draw: same as panlib_draw_indirect_helper for
+ * draw_count draws in a single dispatch.
+ */
+KERNEL(16)
+panlib_draw_multi_indirect_helper(
+   global struct libpan_draw_helper_multi_draw *draws,
+   global struct poly_heap *heap, uint32_t draw_count,
+   uint32_t primitive_vertex_count)
+{
+   uint32_t draw_id = cl_global_id.x;
+   if (draw_id >= draw_count)
+      return;
+
+   global struct libpan_draw_helper_multi_draw *d = &draws[draw_id];
+   struct panlib_draw_info draw =
+      panlib_multi_draw_info(d, heap, primitive_vertex_count);
+
+   panlib_draw_resolve(&draw, (global VkDrawIndirectCommand *)d->cmd,
+                       (global uint32_t *)d->first_vertex_sysval,
+                       (global uint32_t *)d->first_instance_sysval,
+                       (global uint32_t *)d->raw_vertex_offset_sysval);
+}
+
+/* Indexed variant, reading the bounds panlib_draw_multi_index_minmax_search
+ * left in each draw record.
+ */
+KERNEL(16)
+panlib_draw_multi_indexed_indirect_helper(
+   global struct libpan_draw_helper_multi_draw *draws,
+   global uint8_t *index_buffer_ptr, global struct poly_heap *heap,
+   uint32_t draw_count, uint32_t index_size, uint32_t primitive_vertex_count)
+{
+   uint32_t draw_id = cl_global_id.x;
+   if (draw_id >= draw_count)
+      return;
+
+   global struct libpan_draw_helper_multi_draw *d = &draws[draw_id];
+   struct panlib_draw_info draw =
+      panlib_multi_draw_info(d, heap, primitive_vertex_count);
+
+   draw.index.size = index_size;
+   draw.indices = index_buffer_ptr;
+
+   panlib_draw_indexed_resolve(&draw,
+                               (global VkDrawIndexedIndirectCommand *)d->cmd,
+                               d->index_min, d->index_max,
+                               (global uint32_t *)d->first_vertex_sysval,
+                               (global uint32_t *)d->first_instance_sysval,
+                               (global uint32_t *)d->raw_vertex_offset_sysval);
+}
+
+/* Index bounds of every draw of a multi-draw in one dispatch: workgroup row y
+ * searches draw y, the cl_num_groups.x workgroups of a row stride over its
+ * indices. The CPU seeds index_min to the largest index value and index_max
+ * to 0.
+ */
+KERNEL(64)
+panlib_draw_multi_index_minmax_search(
+   global uint8_t *index_buffer_ptr,
+   global struct libpan_draw_helper_multi_draw *draws,
+   uint32_t index_bytes_log2__3, uint8_t primitive_restart__2)
+{
+   global struct libpan_draw_helper_multi_draw *d = &draws[cl_group_id.y];
+   global VkDrawIndexedIndirectCommand *cmd =
+      (global VkDrawIndexedIndirectCommand *)d->cmd;
+
+   const uint32_t index_bit_size = (1 << index_bytes_log2__3) * 8;
+   const uint32_t start = cmd->firstIndex;
+   const uint32_t index_count = cmd->indexCount;
+   const uint32_t lane_count = cl_num_groups.x * cl_local_size.x;
+   const uint32_t lane = cl_global_id.x;
+
+   if (lane >= index_count)
+      return;
+
+   uint32_t local_min = ((uint64_t)1 << index_bit_size) - 1;
+   uint32_t local_max = 0;
+
+   switch (index_bit_size) {
+#define MINMAX_SEARCH_CASE(sz)                                                 \
+   case sz: {                                                                  \
+      global uint##sz##_t *indices =                                           \
+         (global uint##sz##_t *)index_buffer_ptr + start;                      \
+      for (uint32_t i = lane; i < index_count; i += lane_count) {              \
+         uint32_t val = (uint32_t)indices[i];                                  \
+         if (primitive_restart__2 && val == UINT##sz##_MAX)                    \
+            continue;                                                          \
+         local_min = min(local_min, val);                                      \
+         local_max = max(local_max, val);                                      \
+      }                                                                        \
+      break;                                                                   \
+   }
+      MINMAX_SEARCH_CASE(32)
+      MINMAX_SEARCH_CASE(16)
+      MINMAX_SEARCH_CASE(8)
+#undef MINMAX_SEARCH_CASE
+   default:
+      assert(0 && "Invalid index size");
+   }
+
+   atomic_fetch_min((global atomic_uint *)&d->index_min, local_min);
+   atomic_fetch_max((global atomic_uint *)&d->index_max, local_max);
+}
+
 KERNEL(64)
 panlib_draw_index_minmax_search_helper(global uint8_t *index_buffer_ptr,
                                        global VkDrawIndexedIndirectCommand *cmd,
