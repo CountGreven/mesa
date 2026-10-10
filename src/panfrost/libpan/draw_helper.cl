@@ -458,6 +458,77 @@ padded_vertex_count(uint32_t vertex_count, uint32_t instance_count, bool idvs)
    return pan_padded_vertex_count(vertex_count);
 }
 
+/* Resolve a non-indexed draw from its command: fill the counts of draw (whose
+ * descriptor pointers are set), patch its jobs and write the vertex sysvals.
+ */
+static void
+panlib_draw_resolve(struct panlib_draw_info *draw,
+                    global VkDrawIndirectCommand *cmd,
+                    global uint32_t *first_vertex_sysval,
+                    global uint32_t *first_instance_sysval,
+                    global uint32_t *raw_vertex_offset_sysval)
+{
+   const uint32_t vertex_count = cmd->vertexCount;
+   const uint32_t instance_count = cmd->instanceCount;
+   const uint32_t first_vertex = cmd->firstVertex;
+   const uint32_t first_instance = cmd->firstInstance;
+
+   draw->vertex.base = first_vertex;
+   draw->vertex.raw_offset = first_vertex;
+   draw->vertex.count = vertex_count;
+   draw->instance.base = first_instance;
+   draw->instance.count = instance_count;
+   draw->vertex_range = vertex_count;
+   draw->padded_vertex_count =
+      padded_vertex_count(vertex_count, instance_count, draw->idvs_job != NULL);
+
+   panlib_patch_draw(draw);
+
+   *first_vertex_sysval = draw->vertex.base;
+   *first_instance_sysval = draw->instance.base;
+   *raw_vertex_offset_sysval = draw->vertex.raw_offset;
+}
+
+/* Same for an indexed draw, given the bounds of the indices it reads. */
+static void
+panlib_draw_indexed_resolve(struct panlib_draw_info *draw,
+                            global VkDrawIndexedIndirectCommand *cmd,
+                            uint32_t min_vertex, uint32_t max_vertex,
+                            global uint32_t *first_vertex_sysval,
+                            global uint32_t *first_instance_sysval,
+                            global uint32_t *raw_vertex_offset_sysval)
+{
+   const uint32_t index_count = cmd->indexCount;
+   const uint32_t first_index = cmd->firstIndex;
+   const uint32_t first_instance = cmd->firstInstance;
+   const uint32_t instance_count = cmd->instanceCount;
+   const int32_t vertex_offset = cmd->vertexOffset;
+
+   /* The min/max search leaves min > max when no index was visited (zero
+    * index count, or only restart indices). Turn that into a null draw rather
+    * than a wrapped-around vertex range that overflows the varying heap. */
+   const uint32_t vertex_range =
+      (index_count == 0 || min_vertex > max_vertex)
+         ? 0
+         : max_vertex - min_vertex + 1;
+
+   draw->index.offset = first_index;
+   draw->vertex.base = vertex_offset;
+   draw->vertex.raw_offset = min_vertex + vertex_offset;
+   draw->vertex.count = index_count;
+   draw->instance.base = first_instance;
+   draw->instance.count = instance_count;
+   draw->vertex_range = vertex_range;
+   draw->padded_vertex_count =
+      padded_vertex_count(vertex_range, instance_count, draw->idvs_job != NULL);
+
+   panlib_patch_draw(draw);
+
+   *first_vertex_sysval = draw->vertex.base;
+   *first_instance_sysval = draw->instance.base;
+   *raw_vertex_offset_sysval = draw->vertex.raw_offset;
+}
+
 /* Argument ordering choosen to avoid any padding */
 
 KERNEL(1)
@@ -475,21 +546,10 @@ panlib_draw_indirect_helper(
    global uint8_t *vertex_job, global uint8_t *tiler_job,
    uint32_t primitive_vertex_count)
 {
-   const uint32_t vertex_count = cmd->vertexCount;
-   const uint32_t instance_count = cmd->instanceCount;
-   const uint32_t first_vertex = cmd->firstVertex;
-   const uint32_t first_instance = cmd->firstInstance;
-
    struct panlib_draw_info draw = {
       .idvs_job = idvs_job,
       .vertex_job = vertex_job,
       .tiler_job = tiler_job,
-
-      .vertex.base = first_vertex,
-      .vertex.raw_offset = first_vertex,
-      .vertex.count = vertex_count,
-      .instance.base = first_instance,
-      .instance.count = instance_count,
 
       .varying_bufs.descs = varying_bufs_descs,
 
@@ -501,19 +561,13 @@ panlib_draw_indirect_helper(
       .attribs.infos = attribs_infos,
       .attribs.valid = attribs_valid,
 
-      .vertex_range = vertex_count,
-      .padded_vertex_count =
-         padded_vertex_count(vertex_count, instance_count, idvs_job != NULL),
       .primitive_vertex_count = primitive_vertex_count,
 
       .heap = heap,
    };
 
-   panlib_patch_draw(&draw);
-
-   *first_vertex_sysval = draw.vertex.base;
-   *first_instance_sysval = draw.instance.base;
-   *raw_vertex_offset_sysval = draw.vertex.raw_offset;
+   panlib_draw_resolve(&draw, cmd, first_vertex_sysval, first_instance_sysval,
+                       raw_vertex_offset_sysval);
 }
 
 KERNEL(1)
@@ -532,34 +586,12 @@ panlib_draw_indexed_indirect_helper(
    global uint32_t *raw_vertex_offset_sysval, global uint8_t *idvs_job,
    global uint8_t *vertex_job, global uint8_t *tiler_job)
 {
-   const uint32_t index_count = cmd->indexCount;
-   const uint32_t first_index = cmd->firstIndex;
-   const uint32_t first_instance = cmd->firstInstance;
-   const uint32_t instance_count = cmd->instanceCount;
-   const int32_t vertex_offset = cmd->vertexOffset;
-   const uint32_t min_vertex = index_min_max_res->min;
-   const uint32_t max_vertex = index_min_max_res->max;
-
-   /* The min/max search leaves min > max when no index was visited (zero
-    * index count, or only restart indices). Turn that into a null draw rather
-    * than a wrapped-around vertex range that overflows the varying heap. */
-   const uint32_t vertex_range =
-      (index_count == 0 || min_vertex > max_vertex)
-         ? 0
-         : max_vertex - min_vertex + 1;
-
    struct panlib_draw_info draw = {
       .idvs_job = idvs_job,
       .vertex_job = vertex_job,
       .tiler_job = tiler_job,
 
       .index.size = index_size,
-      .index.offset = first_index,
-      .vertex.base = vertex_offset,
-      .vertex.raw_offset = min_vertex + vertex_offset,
-      .vertex.count = index_count,
-      .instance.base = first_instance,
-      .instance.count = instance_count,
 
       .varying_bufs.descs = varying_bufs_descs,
 
@@ -571,20 +603,15 @@ panlib_draw_indexed_indirect_helper(
       .attribs.infos = attribs_infos,
       .attribs.valid = attribs_valid,
 
-      .vertex_range = vertex_range,
-      .padded_vertex_count =
-         padded_vertex_count(vertex_range, instance_count, idvs_job != NULL),
       .primitive_vertex_count = primitive_vertex_count,
       .indices = index_buffer_ptr,
 
       .heap = heap,
    };
 
-   panlib_patch_draw(&draw);
-
-   *first_vertex_sysval = draw.vertex.base;
-   *first_instance_sysval = draw.instance.base;
-   *raw_vertex_offset_sysval = draw.vertex.raw_offset;
+   panlib_draw_indexed_resolve(&draw, cmd, index_min_max_res->min,
+                               index_min_max_res->max, first_vertex_sysval,
+                               first_instance_sysval, raw_vertex_offset_sysval);
 }
 
 KERNEL(64)
