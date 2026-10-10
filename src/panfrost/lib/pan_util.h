@@ -12,7 +12,7 @@
 
 #define PAN_DBG_PERF  0x0001
 #define PAN_DBG_TRACE 0x0002
-/* 0x4 unused */
+#define PAN_DBG_GPU_DRAWS 0x0004
 #define PAN_DBG_DIRTY 0x0008
 #define PAN_DBG_SYNC  0x0010
 /* 0x20 unused */
