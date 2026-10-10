@@ -129,6 +129,8 @@ struct panfrost_transfer {
       struct pipe_resource *rsrc;
       struct pipe_box box;
    } staging;
+   /* Buffer range written through a staging buffer, copied in on the GPU at unmap. */
+   bool buffer_staging;
 };
 
 static inline struct panfrost_transfer *
