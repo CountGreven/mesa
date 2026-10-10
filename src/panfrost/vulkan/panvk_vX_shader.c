@@ -143,11 +143,9 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
       if (PAN_ARCH >= 10)
          return false;
 
-      /* TODO: We only implement single-draw direct and indirect draws, so this
-       * is sufficient. We'll revisit this when we get around to implementing
-       * multidraw. */
+      /* On JM, multidraw is emulated by one indirect draw per draw id. */
       assert(b->shader->info.stage == MESA_SHADER_VERTEX);
-      val = nir_imm_int(b, 0);
+      val = load_sysval(b, graphics, bit_size, vs.draw_id);
       break;
 
    case nir_intrinsic_load_printf_buffer_address:
