@@ -414,6 +414,11 @@ panfrost_batch_write_rsrc(struct panfrost_batch *batch,
 
    uint32_t access = PAN_BO_ACCESS_WRITE | PAN_BO_ACCESS_PER_CTX_TRACKING;
 
+   /* The GPU may write anywhere in the buffer, so cached index bounds are
+    * no longer trustworthy. */
+   if (rsrc->index_cache)
+      rsrc->index_cache->size = 0;
+
    pan_resource_update_access(batch->ctx, rsrc, true);
    panfrost_batch_add_bo_old(batch, rsrc->bo, access);
    panfrost_batch_update_access(batch, rsrc, true);
