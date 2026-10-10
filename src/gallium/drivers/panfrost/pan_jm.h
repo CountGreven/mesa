@@ -93,6 +93,12 @@ void GENX(jm_launch_draw_fullscreen)(struct panfrost_batch *batch,
 
 #if PAN_ARCH == 6 || PAN_ARCH == 7
 uint64_t GENX(jm_get_poly_heap)(struct panfrost_batch *batch);
+void GENX(jm_launch_draw_gpu)(struct panfrost_batch *batch,
+                             const struct pipe_draw_info *info, uint64_t cmd,
+                             unsigned max_index_count, bool barrier);
+
+/* Split batches before their varying heap or job chain gets too full. */
+#define PAN_JM_MAX_GPU_DRAWS_PER_BATCH 1024
 #endif
 
 void GENX(jm_emit_write_timestamp)(struct panfrost_batch *batch,

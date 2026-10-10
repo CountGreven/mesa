@@ -419,6 +419,25 @@ panfrost_batch_write_rsrc(struct panfrost_batch *batch,
    panfrost_batch_update_access(batch, rsrc, true);
 }
 
+/* Does this batch write the resource (not counting other batches)? */
+bool
+panfrost_batch_writes_rsrc(struct panfrost_batch *batch,
+                           struct panfrost_resource *rsrc)
+{
+   if (!rsrc->bo)
+      return false;
+
+   unsigned handle = panfrost_bo_handle(rsrc->bo);
+
+   if (handle >= util_dynarray_num_elements(&batch->bos, pan_bo_access))
+      return false;
+
+   pan_bo_access flags =
+      *util_dynarray_element(&batch->bos, pan_bo_access, handle);
+
+   return flags & PAN_BO_ACCESS_WRITE;
+}
+
 struct panfrost_bo *
 panfrost_batch_create_bo(struct panfrost_batch *batch, size_t size,
                          uint32_t create_flags, mesa_shader_stage stage,

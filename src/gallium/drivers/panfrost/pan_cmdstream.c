@@ -3685,6 +3685,15 @@ prepare_draw(struct pipe_context *pipe, enum mesa_prim prim)
          return NULL;
    }
 
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+   /* GPU-driven draws allocate varyings from a fixed-size per-batch heap. */
+   if (unlikely(batch->jm.gpu_draw_count >= PAN_JM_MAX_GPU_DRAWS_PER_BATCH)) {
+      batch = panfrost_get_fresh_render_batch(ctx, "Too many GPU draws");
+      if (!batch)
+         return NULL;
+   }
+#endif
+
    enum mesa_prim reduced_prim = u_reduced_prim(prim);
 
    if (unlikely(!panfrost_compatible_batch_state(batch, reduced_prim))) {
@@ -3713,6 +3722,134 @@ prepare_draw(struct pipe_context *pipe, enum mesa_prim prim)
    return batch;
 }
 
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+/* Can this draw have its counts and offsets resolved on the GPU by the libpan
+ * draw helper (Bifrost JM)? Opt-in with PAN_MESA_DEBUG=gpudraws for now.
+ */
+static bool
+panfrost_gpu_draw_supported(struct panfrost_context *ctx,
+                            const struct pipe_draw_info *info)
+{
+   struct panfrost_device *dev = pan_device(ctx->base.screen);
+   struct panfrost_compiled_shader *vs = ctx->prog[MESA_SHADER_VERTEX];
+
+   if (!(dev->debug & PAN_DBG_GPU_DRAWS) || !vs)
+      return false;
+
+   /* Primitive queries, transform feedback and its offsets are all counted
+    * on the CPU from the draw parameters.
+    */
+   if (ctx->prim_queries_active || ctx->streamout.num_targets ||
+       ctx->uncompiled[MESA_SHADER_VERTEX]->xfb)
+      return false;
+
+   if (info->index_size) {
+      /* The GPU path reads indices from a buffer object. */
+      if (info->has_user_indices)
+         return false;
+
+      /* The min/max search only knows the all-ones restart index; another
+       * index would inflate the vertex range (to ~4G for 32-bit indices).
+       */
+      if (info->primitive_restart && !panfrost_is_implicit_prim_restart(info))
+         return false;
+   }
+
+   /* gl_NumVertices-style sysvals need the CPU-side vertex count. */
+   for (unsigned i = 0; i < vs->sysvals.sysval_count; ++i) {
+      if (PAN_SYSVAL_TYPE(vs->sysvals.sysvals[i]) == PAN_SYSVAL_NUM_VERTICES)
+         return false;
+   }
+
+   return true;
+}
+
+/* Emit a draw whose parameters live in GPU memory at cmd, laid out as a
+ * Draw[Elements|Arrays]IndirectCommand. The caller added the command and index
+ * buffers to the batch.
+ */
+static void
+panfrost_gpu_draw(struct panfrost_batch *batch,
+                  const struct pipe_draw_info *info, unsigned drawid_offset,
+                  uint64_t cmd, unsigned max_index_count, bool barrier)
+{
+   struct panfrost_context *ctx = batch->ctx;
+
+   panfrost_update_active_prim(ctx, info->mode);
+
+   /* Counts are only known on the GPU: emit templates, with every CPU-side
+    * count/offset zeroed so nothing stale leaks into them.
+    */
+   ctx->gpu_draw = true;
+   ctx->vertex_count = 0;
+   ctx->instance_count = 1;
+   ctx->padded_count = 0;
+   ctx->offset_start = 0;
+   ctx->base_vertex = 0;
+   ctx->base_instance = 0;
+   ctx->drawid = drawid_offset;
+   memset(batch->vertex_offsets_sysval, 0,
+          sizeof(batch->vertex_offsets_sysval));
+
+   batch->indices =
+      info->index_size ? pan_resource(info->index.resource)->plane.base : 0;
+
+   panfrost_update_state_3d(batch);
+   panfrost_update_shader_state(batch, MESA_SHADER_VERTEX);
+   panfrost_update_shader_state(batch, MESA_SHADER_FRAGMENT);
+   panfrost_clean_state_3d(ctx);
+
+   if (!panfrost_batch_skip_rasterization(batch)) {
+      panfrost_bi_emit_varying_descriptor(batch, 0,
+                                          info->mode == MESA_PRIM_POINTS);
+      GENX(jm_launch_draw_gpu)(batch, info, cmd, max_index_count, barrier);
+      batch->draw_count++;
+   }
+
+   ctx->gpu_draw = false;
+}
+
+static void
+panfrost_draw_indirect_gpu(struct pipe_context *pipe,
+                           const struct pipe_draw_info *info,
+                           unsigned drawid_offset,
+                           const struct pipe_draw_indirect_info *indirect)
+{
+   struct panfrost_context *ctx = pan_context(pipe);
+   struct panfrost_batch *batch = prepare_draw(pipe, info->mode);
+   if (!batch) {
+      mesa_loge("prepare_draw failed");
+      return;
+   }
+
+   perf_debug(ctx, "Resolving indirect draw on the GPU");
+
+   struct panfrost_resource *cmd_buf = pan_resource(indirect->buffer);
+   panfrost_batch_read_rsrc(batch, cmd_buf);
+
+   /* If this batch wrote the command or index buffer (transform feedback,
+    * SSBO stores), the helper jobs must wait for all earlier jobs: there is
+    * no finer-grained dependency to express that. This is what broke
+    * KHR-GLES31.core.draw_indirect.advanced-twoPass-transformFeedback-* on
+    * the 2021 implementation.
+    */
+   bool barrier = panfrost_batch_writes_rsrc(batch, cmd_buf);
+   unsigned max_index_count = 0;
+
+   if (info->index_size) {
+      struct panfrost_resource *index_buf = pan_resource(info->index.resource);
+
+      panfrost_batch_read_rsrc(batch, index_buf);
+      barrier |= panfrost_batch_writes_rsrc(batch, index_buf);
+      max_index_count = index_buf->base.width0 / info->index_size;
+   }
+
+   panfrost_gpu_draw(batch, info, drawid_offset,
+                     cmd_buf->plane.base + indirect->offset, max_index_count,
+                     barrier);
+}
+#endif
+
 static void
 panfrost_draw_indirect(struct pipe_context *pipe,
                        const struct pipe_draw_info *info,
@@ -3720,6 +3857,17 @@ panfrost_draw_indirect(struct pipe_context *pipe,
                        const struct pipe_draw_indirect_info *indirect)
 {
    struct panfrost_context *ctx = pan_context(pipe);
+
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+   /* multi_draw_indirect is not exposed before v10, so the frontend already
+    * splits multi-draws into single ones and there is no count buffer.
+    */
+   if (indirect->draw_count <= 1 && !indirect->indirect_draw_count &&
+       panfrost_gpu_draw_supported(ctx, info)) {
+      panfrost_draw_indirect_gpu(pipe, info, drawid_offset, indirect);
+      return;
+   }
+#endif
 
    if (!PAN_GPU_SUPPORTS_DRAW_INDIRECT ||
        panfrost_occlusion_query_active(ctx) ||

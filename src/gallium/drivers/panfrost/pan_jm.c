@@ -18,6 +18,9 @@
 #include "pan_trace.h"
 #include "kmod/panfrost_kmod.h"
 #include "poly/geometry.h"
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+#include "draw_helper.h"
+#endif
 
 #if PAN_ARCH >= 10
 #error "JM helpers are only used for gen < 10"
@@ -1060,6 +1063,208 @@ GENX(jm_get_poly_heap)(struct panfrost_batch *batch)
 
    batch->jm.poly_heap = state.gpu;
    return state.gpu;
+}
+
+/* Address the draw helper writes unused sysvals to. */
+#define PAN_JM_MEMORY_SINK (0x8ull << 60)
+
+static uint64_t
+sysval_or_sink(uint64_t addr)
+{
+   return addr ? addr : PAN_JM_MEMORY_SINK;
+}
+
+/*
+ * Emit a draw whose vertex/index count, instance count, first vertex/index,
+ * base vertex and base instance are read by the GPU from a
+ * VkDraw[Indexed]IndirectCommand-layout record at cmd (which is what GL's
+ * DrawArrays/ElementsIndirectCommand are). All descriptors must have been
+ * emitted with ctx->gpu_draw set. Everything goes in this batch's own
+ * vertex/tiler chain:
+ *
+ *   [WRITE_VALUE min/max seed] -> [min/max search] -> draw helper
+ *      -> vertex -> tiler   (or -> IDVS)
+ *
+ * The helper patches the job headers (NULL for empty draws), invocations,
+ * DRAW/PRIMITIVE descriptors, attribute buffers/attributes and the vertex
+ * sysvals, and allocates varyings from the batch heap. barrier makes the
+ * first job wait for all earlier jobs of the batch, needed when this batch
+ * also writes the indirect or index buffer (e.g. transform feedback).
+ */
+void
+GENX(jm_launch_draw_gpu)(struct panfrost_batch *batch,
+                         const struct pipe_draw_info *info, uint64_t cmd,
+                         unsigned max_index_count, bool barrier)
+{
+   PAN_TRACE_FUNC(PAN_TRACE_GL_JM);
+
+   struct panfrost_context *ctx = batch->ctx;
+   struct panfrost_compiled_shader *vs = ctx->prog[MESA_SHADER_VERTEX];
+   struct pan_jc *jc = &batch->jm.jobs.vtc_jc;
+   bool secondary_shader = vs->info.vs.secondary_enable;
+   bool idvs = vs->info.vs.idvs;
+
+   uint64_t heap = GENX(jm_get_poly_heap)(batch);
+   struct pan_ptr tiler, vertex = {0};
+
+   if (idvs) {
+      tiler = pan_pool_alloc_desc(&batch->pool.base, INDEXED_VERTEX_JOB);
+   } else {
+      vertex = pan_pool_alloc_desc(&batch->pool.base, COMPUTE_JOB);
+      tiler = pan_pool_alloc_desc(&batch->pool.base, TILER_JOB);
+   }
+
+   if (!heap || (!idvs && !vertex.cpu) || !tiler.cpu) {
+      mesa_loge("jm_launch_draw_gpu failed");
+      return;
+   }
+
+   /* Templates: counts, offsets and the index pointer are patched later. */
+   struct mali_invocation_packed invocation;
+   pan_pack_work_groups_compute(&invocation, 1, 1, 1, 1, 1, 1, true, false);
+   const struct pipe_draw_start_count_bias draw = {0};
+
+   jm_emit_tiler_job(batch, info, &draw, &invocation, secondary_shader,
+                     tiler.cpu);
+
+   if (idvs) {
+      jm_emit_vertex_draw(
+         batch, pan_section_ptr(tiler.cpu, INDEXED_VERTEX_JOB, VERTEX_DRAW));
+   } else {
+      jm_emit_vertex_job(batch, info, &invocation, vertex.cpu);
+   }
+
+   unsigned helper_dep = 0;
+   uint64_t minmax = 0;
+
+   if (info->index_size) {
+      struct pan_ptr res = pan_pool_alloc_aligned(
+         &batch->pool.base,
+         sizeof(struct libpan_draw_helper_index_min_max_result), 8);
+      struct pan_ptr seed =
+         pan_pool_alloc_desc(&batch->pool.base, WRITE_VALUE_JOB);
+
+      if (!res.cpu || !seed.cpu) {
+         mesa_loge("jm_launch_draw_gpu failed");
+         return;
+      }
+
+      /* min = largest index value, max = 0 */
+      pan_section_pack(seed.cpu, WRITE_VALUE_JOB, PAYLOAD, cfg) {
+         cfg.type = MALI_WRITE_VALUE_TYPE_IMMEDIATE_64;
+         cfg.address = res.gpu;
+         cfg.immediate_value = BITFIELD64_MASK(info->index_size * 8);
+      }
+
+      unsigned seed_job = pan_jc_add_job(jc, MALI_JOB_TYPE_WRITE_VALUE,
+                                         barrier, false, 0, 0, &seed, false);
+      barrier = false;
+
+      /* 64 threads per workgroup, 1024 indices per thread. */
+      unsigned wg_count = DIV_ROUND_UP(MAX2(max_index_count, 1), 65536);
+
+      const struct panlib_draw_index_minmax_search_helper_args args = {
+         .index_buffer_ptr = batch->indices,
+         .cmd = cmd,
+         .min_ptr = res.gpu +
+                    offsetof(struct libpan_draw_helper_index_min_max_result,
+                             min),
+         .max_ptr = res.gpu +
+                    offsetof(struct libpan_draw_helper_index_min_max_result,
+                             max),
+      };
+      panlib_draw_index_minmax_search_helper_struct(
+         batch, panlib_1d_with_jm_deps(wg_count, seed_job, 0),
+         PANLIB_BARRIER_NONE, args, util_logbase2(info->index_size),
+         info->primitive_restart);
+
+      helper_dep = jc->job_index;
+      minmax = res.gpu;
+   }
+
+   /* The helper rewrites the descriptors of the jobs right behind it, so
+    * they must not be prefetched before it is done.
+    */
+   enum panlib_barrier helper_barrier =
+      PANLIB_BARRIER_JM_SUPPRESS_PREFETCH |
+      (barrier ? PANLIB_BARRIER_JM_BARRIER : PANLIB_BARRIER_NONE);
+   struct panlib_precomp_grid grid = panlib_1d_with_jm_deps(1, helper_dep, 0);
+   uint32_t prim_vertex_count = MAX2(mesa_vertices_per_prim(info->mode), 1);
+
+   /* GL's gl_BaseVertex is 0 for non-indexed draws, which is what the CPU
+    * already packed, so only indexed draws let the helper write it.
+    */
+   uint64_t raw_vertex_offset_sysval =
+      sysval_or_sink(batch->vertex_offsets_sysval[0]);
+   uint64_t base_vertex_sysval =
+      info->index_size ? sysval_or_sink(batch->vertex_offsets_sysval[1])
+                       : PAN_JM_MEMORY_SINK;
+   uint64_t base_instance_sysval =
+      sysval_or_sink(batch->vertex_offsets_sysval[2]);
+
+   if (info->index_size) {
+      const struct panlib_draw_indexed_indirect_helper_args args = {
+         .cmd = cmd,
+         .index_buffer_ptr = batch->indices,
+         .index_min_max_res = minmax,
+         .index_size = info->index_size,
+         .primitive_vertex_count = prim_vertex_count,
+         .attrib_bufs_valid = batch->gpu_draw.attrib_bufs_valid,
+         .attribs_valid = batch->gpu_draw.attribs_valid,
+         .heap = heap,
+         .varying_bufs_descs = batch->varyings.bufs,
+         .attrib_bufs_descs = batch->attrib_bufs[MESA_SHADER_VERTEX],
+         .attrib_bufs_infos = batch->gpu_draw.attrib_bufs_infos,
+         .attribs_descs = batch->attribs[MESA_SHADER_VERTEX],
+         .attribs_infos = batch->gpu_draw.attribs_infos,
+         .first_vertex_sysval = base_vertex_sysval,
+         .first_instance_sysval = base_instance_sysval,
+         .raw_vertex_offset_sysval = raw_vertex_offset_sysval,
+         .idvs_job = idvs ? tiler.gpu : 0,
+         .vertex_job = idvs ? 0 : vertex.gpu,
+         .tiler_job = idvs ? 0 : tiler.gpu,
+      };
+      panlib_draw_indexed_indirect_helper_struct(batch, grid, helper_barrier,
+                                                 args);
+   } else {
+      const struct panlib_draw_indirect_helper_args args = {
+         .cmd = cmd,
+         .heap = heap,
+         .varying_bufs_descs = batch->varyings.bufs,
+         .attrib_bufs_descs = batch->attrib_bufs[MESA_SHADER_VERTEX],
+         .attrib_bufs_infos = batch->gpu_draw.attrib_bufs_infos,
+         .attrib_bufs_valid = batch->gpu_draw.attrib_bufs_valid,
+         .attribs_valid = batch->gpu_draw.attribs_valid,
+         .attribs_descs = batch->attribs[MESA_SHADER_VERTEX],
+         .attribs_infos = batch->gpu_draw.attribs_infos,
+         .first_vertex_sysval = base_vertex_sysval,
+         .first_instance_sysval = base_instance_sysval,
+         .raw_vertex_offset_sysval = raw_vertex_offset_sysval,
+         .idvs_job = idvs ? tiler.gpu : 0,
+         .vertex_job = idvs ? 0 : vertex.gpu,
+         .tiler_job = idvs ? 0 : tiler.gpu,
+         .primitive_vertex_count = prim_vertex_count,
+      };
+      panlib_draw_indirect_helper_struct(batch, grid, helper_barrier, args);
+   }
+
+   unsigned helper_job = jc->job_index;
+
+   /* Tiling jobs get their dependency_2 forced to the previous tiling job,
+    * so the dependency on the helper must go in dependency_1.
+    */
+   if (idvs) {
+      pan_jc_add_job(jc, MALI_JOB_TYPE_INDEXED_VERTEX, false, false,
+                     helper_job, 0, &tiler, false);
+   } else {
+      unsigned vertex_job = pan_jc_add_job(jc, MALI_JOB_TYPE_VERTEX, false,
+                                           true, helper_job, 0, &vertex,
+                                           false);
+      pan_jc_add_job(jc, MALI_JOB_TYPE_TILER, false, false, vertex_job, 0,
+                     &tiler, false);
+   }
+
+   batch->jm.gpu_draw_count++;
 }
 #endif
 

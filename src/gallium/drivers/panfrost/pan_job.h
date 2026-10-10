@@ -252,6 +252,9 @@ bool panfrost_any_batch_reads_rsrc(struct panfrost_context *ctx,
 bool panfrost_any_batch_writes_rsrc(struct panfrost_context *ctx,
                                     struct panfrost_resource *rsrc);
 
+bool panfrost_batch_writes_rsrc(struct panfrost_batch *batch,
+                                struct panfrost_resource *rsrc);
+
 struct panfrost_bo *panfrost_batch_create_bo(struct panfrost_batch *batch,
                                              size_t size, uint32_t create_flags,
                                              mesa_shader_stage stage,
