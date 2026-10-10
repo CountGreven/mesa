@@ -314,7 +314,7 @@ panvk_per_arch(get_physical_device_features)(
       .sampleRateShading = true,
       .dualSrcBlend = true,
       .logicOp = true,
-      .multiDrawIndirect = PAN_ARCH >= 10,
+      .multiDrawIndirect = true,
       .drawIndirectFirstInstance = true,
       .depthClamp = true,
       .depthBiasClamp = true,
@@ -973,7 +973,7 @@ panvk_per_arch(get_physical_device_properties)(
       .mipmapPrecisionBits = 8,
       /* Software limit. */
       .maxDrawIndexedIndexValue = UINT32_MAX,
-      .maxDrawIndirectCount = PAN_ARCH >= 10 ? UINT32_MAX : 1,
+      .maxDrawIndirectCount = UINT32_MAX,
       .maxSamplerLodBias = (float)INT16_MAX / 256.0f,
       .maxSamplerAnisotropy = 16,
       .maxViewports = 1,
