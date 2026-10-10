@@ -1839,19 +1839,21 @@ panvk_per_arch(CmdDrawIndirect)(VkCommandBuffer commandBuffer, VkBuffer _buffer,
    if (drawCount == 0)
       return;
 
-   /* We cannot support arbitrary draw count on JM */
-   assert(drawCount == 1);
+   /* Multidraw is emulated: one single-draw indirect per draw id. */
+   uint64_t base_addr = panvk_buffer_gpu_ptr(buffer, offset);
+   for (uint32_t i = 0; i < drawCount; i++) {
+      struct panvk_draw_data draw = {
+         .info = {
+            .indirect.buffer_dev_addr = base_addr + (uint64_t)i * stride,
+            .indirect.draw_count = 1,
+            .indirect.stride = stride,
+            .draw_id = i,
+            .prim = panvk_get_client_prim(cmdbuf),
+         },
+      };
 
-   struct panvk_draw_data draw = {
-      .info = {
-         .indirect.buffer_dev_addr = panvk_buffer_gpu_ptr(buffer, offset),
-         .indirect.draw_count = drawCount,
-         .indirect.stride = stride,
-         .prim = panvk_get_client_prim(cmdbuf),
-      },
-   };
-
-   panvk_cmd_draw_indirect(cmdbuf, &draw);
+      panvk_cmd_draw_indirect(cmdbuf, &draw);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1871,20 +1873,22 @@ panvk_per_arch(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
    if (drawCount == 0 || cmdbuf->state.gfx.ib.size == 0)
       return;
 
-   /* We cannot support arbitrary draw count on JM */
-   assert(drawCount == 1);
+   /* Multidraw is emulated: one single-draw indirect per draw id. */
+   uint64_t base_addr = panvk_buffer_gpu_ptr(buffer, offset);
+   for (uint32_t i = 0; i < drawCount; i++) {
+      struct panvk_draw_data draw = {
+         .info = {
+            .index = panvk_draw_info_index(cmdbuf, 0),
+            .indirect.buffer_dev_addr = base_addr + (uint64_t)i * stride,
+            .indirect.draw_count = 1,
+            .indirect.stride = stride,
+            .draw_id = i,
+            .prim = panvk_get_client_prim(cmdbuf),
+         },
+      };
 
-   struct panvk_draw_data draw = {
-      .info = {
-         .index = panvk_draw_info_index(cmdbuf, 0),
-         .indirect.buffer_dev_addr = panvk_buffer_gpu_ptr(buffer, offset),
-         .indirect.draw_count = drawCount,
-         .indirect.stride = stride,
-         .prim = panvk_get_client_prim(cmdbuf),
-      },
-   };
-
-   panvk_cmd_draw_indirect(cmdbuf, &draw);
+      panvk_cmd_draw_indirect(cmdbuf, &draw);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
