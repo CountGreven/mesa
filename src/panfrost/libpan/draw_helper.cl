@@ -536,7 +536,14 @@ panlib_draw_indexed_indirect_helper(
    const int32_t vertex_offset = cmd->vertexOffset;
    const uint32_t min_vertex = index_min_max_res->min;
    const uint32_t max_vertex = index_min_max_res->max;
-   const uint32_t vertex_range = max_vertex - min_vertex + 1;
+
+   /* The min/max search leaves min > max when no index was visited (zero
+    * index count, or only restart indices). Turn that into a null draw rather
+    * than a wrapped-around vertex range that overflows the varying heap. */
+   const uint32_t vertex_range =
+      (index_count == 0 || min_vertex > max_vertex)
+         ? 0
+         : max_vertex - min_vertex + 1;
 
    struct panlib_draw_info draw = {
       .idvs_job = idvs_job,
