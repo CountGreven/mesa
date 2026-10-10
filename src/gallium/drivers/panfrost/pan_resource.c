@@ -1643,6 +1643,30 @@ panfrost_ptr_map(struct pipe_context *pctx, struct pipe_resource *resource,
       usage |= PIPE_MAP_DISCARD_WHOLE_RESOURCE;
    }
 
+   /* Streaming a range into a buffer the GPU is still reading (glBufferSubData, or a map that
+    * invalidates the range): the data goes to a staging buffer, copied into place on the GPU at
+    * unmap, ordered after the reads of the old contents. Shadowing the whole BO instead means a CPU
+    * copy of the entire buffer out of uncached memory (Minecraft 26.x: 128 MiB per map, 0.3 fps).
+    * From JimVulkan/mali-panfrost (MIT). */
+   struct panfrost_screen *pscreen = pan_screen(pctx->screen);
+   if (resource->target == PIPE_BUFFER && (usage & PIPE_MAP_WRITE) &&
+       (usage & PIPE_MAP_DISCARD_RANGE) &&
+       !(usage & (PIPE_MAP_UNSYNCHRONIZED | PIPE_MAP_READ | PIPE_MAP_PERSISTENT |
+                  PIPE_MAP_DISCARD_WHOLE_RESOURCE)) &&
+       !(resource->flags & PIPE_RESOURCE_FLAG_MAP_PERSISTENT) && box->width &&
+       box->x % 4 == 0 && box->width % 4 == 0 && pscreen->vtbl.compute_copy_buffer &&
+       (panfrost_any_batch_reads_rsrc(ctx, rsrc) || !panfrost_bo_wait(bo, 0, true))) {
+      struct pipe_resource *staging =
+         pipe_buffer_create(pctx->screen, 0, PIPE_USAGE_STAGING, box->width);
+      if (staging && !panfrost_bo_mmap(pan_resource(staging)->bo)) {
+         transfer->staging.rsrc = staging;
+         transfer->staging.box = *box;
+         transfer->buffer_staging = true;
+         return pan_resource(staging)->bo->ptr.cpu;
+      }
+      pipe_resource_reference(&staging, NULL);
+   }
+
    bool create_new_bo = usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE;
    bool copy_resource = false;
 
@@ -2317,6 +2341,21 @@ panfrost_ptr_unmap(struct pipe_context *pctx, struct pipe_transfer *transfer)
    struct panfrost_resource *prsrc =
       (struct panfrost_resource *)transfer->resource;
    struct panfrost_device *dev = pan_device(pctx->screen);
+
+   if (trans->buffer_staging) {
+      pan_screen(pctx->screen)->vtbl.compute_copy_buffer(
+         pctx, prsrc, transfer->box.x, pan_resource(trans->staging.rsrc), 0,
+         transfer->box.width);
+      pipe_resource_reference(&trans->staging.rsrc, NULL);
+      util_range_add(&prsrc->base, &prsrc->valid_buffer_range, transfer->box.x,
+                     transfer->box.x + transfer->box.width);
+      pan_minmax_cache_invalidate(prsrc->index_cache,
+                                  util_format_get_blocksize(prsrc->base.format),
+                                  transfer->box.x, transfer->box.width);
+      pipe_resource_reference(&transfer->resource, NULL);
+      ralloc_free(transfer);
+      return;
+   }
 
    if (transfer->usage & PIPE_MAP_WRITE)
       pan_crc_state_invalidate(&prsrc->crc_state);
