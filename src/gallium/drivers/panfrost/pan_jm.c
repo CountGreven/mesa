@@ -1293,6 +1293,176 @@ GENX(jm_launch_draw_gpu)(struct panfrost_batch *batch,
 
    batch->jm.gpu_draw_count++;
 }
+
+/*
+ * Multi-draws resolved on the GPU with one dispatch per kind of work instead
+ * of per draw:
+ *
+ *   [min/max search, draws x W workgroups]   (indexed only)
+ *      -> draw helper (one lane per draw, SUPPRESS_PREFETCH)
+ *         -> vertex 0 -> tiler 0, ..., vertex N-1 -> tiler N-1   (or IDVS)
+ *
+ * Each draw gets its own descriptors and job templates, recorded with
+ * jm_multi_draw_add() while the draw state is current, and the whole group is
+ * queued by jm_multi_draw_end(). The min/max slots are seeded on the CPU: the
+ * batch pool is written before the batch is submitted, and only once.
+ */
+bool
+GENX(jm_multi_draw_begin)(struct panfrost_batch *batch,
+                          struct panfrost_jm_multi_draw *md,
+                          unsigned max_draws)
+{
+   struct pan_ptr records = pan_pool_alloc_aligned(
+      &batch->pool.base,
+      max_draws * sizeof(struct libpan_draw_helper_multi_draw), 8);
+
+   *md = (struct panfrost_jm_multi_draw){
+      .records = records.cpu,
+      .records_gpu = records.gpu,
+      .jobs = calloc(max_draws, sizeof(*md->jobs)),
+      .max = max_draws,
+   };
+
+   if (!records.cpu || !md->jobs) {
+      free(md->jobs);
+      md->jobs = NULL;
+      return false;
+   }
+
+   return true;
+}
+
+void
+GENX(jm_multi_draw_add)(struct panfrost_batch *batch,
+                        struct panfrost_jm_multi_draw *md,
+                        const struct pipe_draw_info *info, uint64_t cmd)
+{
+   assert(md->count < md->max);
+
+   struct pan_ptr vertex, tiler;
+   if (!jm_emit_gpu_draw_templates(batch, info, &vertex, &tiler)) {
+      mesa_loge("jm_multi_draw_add failed");
+      return;
+   }
+
+   bool idvs = !vertex.cpu;
+
+   /* See jm_launch_draw_gpu() for the base vertex sysval. */
+   md->records[md->count] = (struct libpan_draw_helper_multi_draw){
+      .cmd = cmd,
+      .varying_bufs_descs = batch->varyings.bufs,
+      .attrib_bufs_descs = batch->attrib_bufs[MESA_SHADER_VERTEX],
+      .attrib_bufs_infos = batch->gpu_draw.attrib_bufs_infos,
+      .attribs_descs = batch->attribs[MESA_SHADER_VERTEX],
+      .attribs_infos = batch->gpu_draw.attribs_infos,
+      .first_vertex_sysval =
+         info->index_size ? sysval_or_sink(batch->vertex_offsets_sysval[1])
+                          : PAN_JM_MEMORY_SINK,
+      .first_instance_sysval = sysval_or_sink(batch->vertex_offsets_sysval[2]),
+      .raw_vertex_offset_sysval =
+         sysval_or_sink(batch->vertex_offsets_sysval[0]),
+      .idvs_job = idvs ? tiler.gpu : 0,
+      .vertex_job = idvs ? 0 : vertex.gpu,
+      .tiler_job = idvs ? 0 : tiler.gpu,
+      .attrib_bufs_valid = batch->gpu_draw.attrib_bufs_valid,
+      .attribs_valid = batch->gpu_draw.attribs_valid,
+      .index_min = info->index_size ? BITFIELD_MASK(info->index_size * 8) : 0,
+      .index_max = 0,
+   };
+   md->jobs[md->count].vertex = vertex;
+   md->jobs[md->count].tiler = tiler;
+   md->count++;
+}
+
+/* Lanes per workgroup of panlib_draw_multi_[indexed_]indirect_helper. */
+#define PAN_JM_MULTI_DRAW_HELPER_WG_SIZE 16
+
+void
+GENX(jm_multi_draw_end)(struct panfrost_batch *batch,
+                        struct panfrost_jm_multi_draw *md,
+                        const struct pipe_draw_info *info,
+                        unsigned max_index_count, bool barrier)
+{
+   PAN_TRACE_FUNC(PAN_TRACE_GL_JM);
+
+   struct pan_jc *jc = &batch->jm.jobs.vtc_jc;
+   uint64_t heap = md->count ? GENX(jm_get_poly_heap)(batch) : 0;
+
+   if (!heap) {
+      if (md->count)
+         mesa_loge("jm_multi_draw_end failed");
+      goto out;
+   }
+
+   unsigned helper_dep = 0;
+
+   if (info->index_size) {
+      /* One workgroup row per draw. Few draws get more workgroups each to
+       * keep the GPU busy on big index ranges; lanes stride over the draw's
+       * indices, so any count works.
+       */
+      unsigned wgs_per_draw =
+         CLAMP(DIV_ROUND_UP(max_index_count, 65536), 1, MAX2(64 / md->count, 1));
+
+      const struct panlib_draw_multi_index_minmax_search_args args = {
+         .index_buffer_ptr = batch->indices,
+         .draws = md->records_gpu,
+      };
+      panlib_draw_multi_index_minmax_search_struct(
+         batch, panlib_3d_with_jm_deps(wgs_per_draw, md->count, 1, 0, 0),
+         barrier ? PANLIB_BARRIER_JM_BARRIER : PANLIB_BARRIER_NONE, args,
+         util_logbase2(info->index_size), info->primitive_restart);
+
+      helper_dep = jc->job_index;
+      barrier = false;
+   }
+
+   /* The helper rewrites the descriptors of the jobs right behind it, so
+    * they must not be prefetched before it is done.
+    */
+   enum panlib_barrier helper_barrier =
+      PANLIB_BARRIER_JM_SUPPRESS_PREFETCH |
+      (barrier ? PANLIB_BARRIER_JM_BARRIER : PANLIB_BARRIER_NONE);
+   struct panlib_precomp_grid grid = panlib_1d_with_jm_deps(
+      DIV_ROUND_UP(md->count, PAN_JM_MULTI_DRAW_HELPER_WG_SIZE), helper_dep,
+      0);
+   uint32_t prim_vertex_count = MAX2(mesa_vertices_per_prim(info->mode), 1);
+
+   if (info->index_size) {
+      const struct panlib_draw_multi_indexed_indirect_helper_args args = {
+         .draws = md->records_gpu,
+         .index_buffer_ptr = batch->indices,
+         .heap = heap,
+         .draw_count = md->count,
+         .index_size = info->index_size,
+         .primitive_vertex_count = prim_vertex_count,
+      };
+      panlib_draw_multi_indexed_indirect_helper_struct(batch, grid,
+                                                       helper_barrier, args);
+   } else {
+      const struct panlib_draw_multi_indirect_helper_args args = {
+         .draws = md->records_gpu,
+         .heap = heap,
+         .draw_count = md->count,
+         .primitive_vertex_count = prim_vertex_count,
+      };
+      panlib_draw_multi_indirect_helper_struct(batch, grid, helper_barrier,
+                                               args);
+   }
+
+   unsigned helper_job = jc->job_index;
+
+   for (unsigned i = 0; i < md->count; i++)
+      jm_add_gpu_draw_jobs(batch, helper_job, &md->jobs[i].vertex,
+                           &md->jobs[i].tiler);
+
+   batch->jm.gpu_draw_count += md->count;
+
+out:
+   free(md->jobs);
+   md->jobs = NULL;
+   md->count = 0;
+}
 #endif
 
 void

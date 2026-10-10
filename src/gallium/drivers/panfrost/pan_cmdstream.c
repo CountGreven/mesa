@@ -3839,22 +3839,21 @@ panfrost_gpu_draw_supported(struct panfrost_context *ctx,
    return true;
 }
 
-/* Emit a draw whose parameters live in GPU memory at cmd, laid out as a
- * Draw[Elements|Arrays]IndirectCommand. The caller added the command and index
- * buffers to the batch.
+/* Emit the state of a draw whose parameters live in GPU memory: counts are
+ * only known on the GPU, so descriptors are emitted as templates with every
+ * CPU-side count/offset zeroed so nothing stale leaks into them. Returns
+ * whether the draw rasterizes, in which case the caller queues its jobs. The
+ * caller clears ctx->gpu_draw once done.
  */
-static void
-panfrost_gpu_draw(struct panfrost_batch *batch,
-                  const struct pipe_draw_info *info, unsigned drawid_offset,
-                  uint64_t cmd, unsigned max_index_count, bool barrier)
+static bool
+panfrost_gpu_draw_emit_state(struct panfrost_batch *batch,
+                             const struct pipe_draw_info *info,
+                             unsigned drawid)
 {
    struct panfrost_context *ctx = batch->ctx;
 
    panfrost_update_active_prim(ctx, info->mode);
 
-   /* Counts are only known on the GPU: emit templates, with every CPU-side
-    * count/offset zeroed so nothing stale leaks into them.
-    */
    ctx->gpu_draw = true;
    ctx->vertex_count = 0;
    ctx->instance_count = 1;
@@ -3862,7 +3861,7 @@ panfrost_gpu_draw(struct panfrost_batch *batch,
    ctx->offset_start = 0;
    ctx->base_vertex = 0;
    ctx->base_instance = 0;
-   ctx->drawid = drawid_offset;
+   ctx->drawid = drawid;
    memset(batch->vertex_offsets_sysval, 0,
           sizeof(batch->vertex_offsets_sysval));
 
@@ -3874,14 +3873,59 @@ panfrost_gpu_draw(struct panfrost_batch *batch,
    panfrost_update_shader_state(batch, MESA_SHADER_FRAGMENT);
    panfrost_clean_state_3d(ctx);
 
-   if (!panfrost_batch_skip_rasterization(batch)) {
-      panfrost_bi_emit_varying_descriptor(batch, 0,
-                                          info->mode == MESA_PRIM_POINTS);
+   if (panfrost_batch_skip_rasterization(batch))
+      return false;
+
+   panfrost_bi_emit_varying_descriptor(batch, 0,
+                                       info->mode == MESA_PRIM_POINTS);
+   return true;
+}
+
+/* Emit a draw whose parameters live in GPU memory at cmd, laid out as a
+ * Draw[Elements|Arrays]IndirectCommand. The caller added the command and index
+ * buffers to the batch.
+ */
+static void
+panfrost_gpu_draw(struct panfrost_batch *batch,
+                  const struct pipe_draw_info *info, unsigned drawid_offset,
+                  uint64_t cmd, unsigned max_index_count, bool barrier)
+{
+   if (panfrost_gpu_draw_emit_state(batch, info, drawid_offset)) {
       GENX(jm_launch_draw_gpu)(batch, info, cmd, max_index_count, barrier);
       batch->draw_count++;
    }
 
-   ctx->gpu_draw = false;
+   batch->ctx->gpu_draw = false;
+}
+
+/* Add the indirect command and index buffers of a GPU-resolved draw to the
+ * batch. Returns whether the helper jobs need a barrier: if this batch wrote
+ * either buffer (transform feedback, SSBO stores), they must wait for all
+ * earlier jobs, there is no finer-grained dependency to express that. This is
+ * what broke KHR-GLES31.core.draw_indirect.advanced-twoPass-transformFeedback-*
+ * on the 2021 implementation.
+ */
+static bool
+panfrost_gpu_draw_add_bufs(struct panfrost_batch *batch,
+                           const struct pipe_draw_info *info,
+                           const struct pipe_draw_indirect_info *indirect,
+                           unsigned *max_index_count)
+{
+   struct panfrost_resource *cmd_buf = pan_resource(indirect->buffer);
+   panfrost_batch_read_rsrc(batch, cmd_buf);
+
+   bool barrier = panfrost_batch_writes_rsrc(batch, cmd_buf);
+   *max_index_count = 0;
+
+   if (info->index_size) {
+      struct panfrost_resource *index_buf = pan_resource(info->index.resource);
+
+      panfrost_batch_read_rsrc(batch, index_buf);
+      barrier |= panfrost_batch_writes_rsrc(batch, index_buf);
+      *max_index_count = index_buf->base.width0 / info->index_size;
+   }
+
+   return barrier;
 }
 
 static void
@@ -3899,29 +3943,70 @@ panfrost_draw_indirect_gpu(struct pipe_context *pipe,
 
    perf_debug(ctx, "Resolving indirect draw on the GPU");
 
-   struct panfrost_resource *cmd_buf = pan_resource(indirect->buffer);
-   panfrost_batch_read_rsrc(batch, cmd_buf);
-
-   /* If this batch wrote the command or index buffer (transform feedback,
-    * SSBO stores), the helper jobs must wait for all earlier jobs: there is
-    * no finer-grained dependency to express that. This is what broke
-    * KHR-GLES31.core.draw_indirect.advanced-twoPass-transformFeedback-* on
-    * the 2021 implementation.
-    */
-   bool barrier = panfrost_batch_writes_rsrc(batch, cmd_buf);
-   unsigned max_index_count = 0;
-
-   if (info->index_size) {
-      struct panfrost_resource *index_buf = pan_resource(info->index.resource);
-
-      panfrost_batch_read_rsrc(batch, index_buf);
-      barrier |= panfrost_batch_writes_rsrc(batch, index_buf);
-      max_index_count = index_buf->base.width0 / info->index_size;
-   }
+   unsigned max_index_count;
+   bool barrier =
+      panfrost_gpu_draw_add_bufs(batch, info, indirect, &max_index_count);
 
    panfrost_gpu_draw(batch, info, drawid_offset,
-                     cmd_buf->plane.base + indirect->offset, max_index_count,
-                     barrier);
+                     pan_resource(indirect->buffer)->plane.base +
+                        indirect->offset,
+                     max_index_count, barrier);
+}
+
+/* Multi-draw indirect resolved on the GPU: one index bounds search and one
+ * draw helper dispatch for all the draws of a batch, rather than for each
+ * draw. Each draw still gets its own descriptors, sysvals (gl_DrawID, base
+ * vertex/instance) and vertex/tiler jobs.
+ */
+static void
+panfrost_multi_draw_indirect_gpu(struct pipe_context *pipe,
+                                 const struct pipe_draw_info *info,
+                                 unsigned drawid_offset,
+                                 const struct pipe_draw_indirect_info *indirect)
+{
+   struct panfrost_context *ctx = pan_context(pipe);
+   unsigned cmd_size = (info->index_size ? 5 : 4) * sizeof(uint32_t);
+   unsigned stride = indirect->stride ? indirect->stride : cmd_size;
+   uint64_t cmd = pan_resource(indirect->buffer)->plane.base + indirect->offset;
+
+   perf_debug(ctx, "Resolving indirect multi-draw on the GPU");
+
+   for (unsigned done = 0; done < indirect->draw_count;) {
+      struct panfrost_batch *batch = prepare_draw(pipe, info->mode);
+      if (!batch) {
+         mesa_loge("prepare_draw failed");
+         return;
+      }
+
+      /* prepare_draw() leaves room for at least one GPU draw. */
+      unsigned n = MIN2(indirect->draw_count - done,
+                        PAN_JM_MAX_GPU_DRAWS_PER_BATCH -
+                           batch->jm.gpu_draw_count);
+      unsigned max_index_count;
+      bool barrier =
+         panfrost_gpu_draw_add_bufs(batch, info, indirect, &max_index_count);
+
+      struct panfrost_jm_multi_draw md;
+      if (!GENX(jm_multi_draw_begin)(batch, &md, n)) {
+         mesa_loge("jm_multi_draw_begin failed");
+         return;
+      }
+
+      for (unsigned i = 0; i < n; i++, done++) {
+         /* Every draw has its own gl_DrawID and vertex sysvals. */
+         ctx->dirty |= PAN_DIRTY_PARAMS | PAN_DIRTY_DRAWID;
+
+         if (panfrost_gpu_draw_emit_state(batch, info, drawid_offset + done)) {
+            GENX(jm_multi_draw_add)(batch, &md, info,
+                                    cmd + (uint64_t)done * stride);
+            batch->draw_count++;
+         }
+
+         ctx->gpu_draw = false;
+      }
+
+      GENX(jm_multi_draw_end)(batch, &md, info, max_index_count, barrier);
+   }
 }
 #endif
 
@@ -3934,12 +4019,33 @@ panfrost_draw_indirect(struct pipe_context *pipe,
    struct panfrost_context *ctx = pan_context(pipe);
 
 #if PAN_ARCH == 6 || PAN_ARCH == 7
-   /* multi_draw_indirect is not exposed before v10, so the frontend already
-    * splits multi-draws into single ones and there is no count buffer.
+   /* multi_draw_indirect is only exposed with gpudraws before v10, and
+    * multi_draw_indirect_params never, so there is no count buffer.
     */
-   if (indirect->draw_count <= 1 && !indirect->indirect_draw_count &&
-       panfrost_gpu_draw_supported(ctx, info)) {
-      panfrost_draw_indirect_gpu(pipe, info, drawid_offset, indirect);
+   assert(!indirect->indirect_draw_count);
+
+   if (panfrost_gpu_draw_supported(ctx, info)) {
+      if (indirect->draw_count > 1)
+         panfrost_multi_draw_indirect_gpu(pipe, info, drawid_offset, indirect);
+      else if (indirect->draw_count == 1)
+         panfrost_draw_indirect_gpu(pipe, info, drawid_offset, indirect);
+      return;
+   }
+
+   /* Otherwise split multi-draws like the frontend does without
+    * multi_draw_indirect.
+    */
+   if (indirect->draw_count != 1) {
+      struct pipe_draw_indirect_info single = *indirect;
+      unsigned cmd_size = (info->index_size ? 5 : 4) * sizeof(uint32_t);
+
+      single.draw_count = 1;
+      single.stride = 0;
+
+      for (unsigned i = 0; i < indirect->draw_count; i++) {
+         panfrost_draw_indirect(pipe, info, drawid_offset + i, &single);
+         single.offset += indirect->stride ? indirect->stride : cmd_size;
+      }
       return;
    }
 #endif

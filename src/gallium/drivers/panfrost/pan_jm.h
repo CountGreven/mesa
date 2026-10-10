@@ -99,6 +99,34 @@ void GENX(jm_launch_draw_gpu)(struct panfrost_batch *batch,
 
 /* Split batches before their varying heap or job chain gets too full. */
 #define PAN_JM_MAX_GPU_DRAWS_PER_BATCH 1024
+
+struct libpan_draw_helper_multi_draw;
+
+/* A multi-draw being recorded for GPU resolution, see jm_multi_draw_begin(). */
+struct panfrost_jm_multi_draw {
+   /* Per-draw helper records, in the batch pool. */
+   struct libpan_draw_helper_multi_draw *records;
+   uint64_t records_gpu;
+
+   /* Per-draw job templates, queued by jm_multi_draw_end(). vertex is
+    * zeroed for IDVS. */
+   struct {
+      struct pan_ptr vertex, tiler;
+   } *jobs;
+
+   unsigned count, max;
+};
+
+bool GENX(jm_multi_draw_begin)(struct panfrost_batch *batch,
+                               struct panfrost_jm_multi_draw *md,
+                               unsigned max_draws);
+void GENX(jm_multi_draw_add)(struct panfrost_batch *batch,
+                             struct panfrost_jm_multi_draw *md,
+                             const struct pipe_draw_info *info, uint64_t cmd);
+void GENX(jm_multi_draw_end)(struct panfrost_batch *batch,
+                             struct panfrost_jm_multi_draw *md,
+                             const struct pipe_draw_info *info,
+                             unsigned max_index_count, bool barrier);
 #endif
 
 void GENX(jm_emit_write_timestamp)(struct panfrost_batch *batch,
