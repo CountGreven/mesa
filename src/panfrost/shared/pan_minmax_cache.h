@@ -10,7 +10,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define PANFROST_MINMAX_SIZE 64
+#define PANFROST_MINMAX_SIZE 512
 
 struct pan_minmax_cache {
    uint64_t keys[PANFROST_MINMAX_SIZE];
