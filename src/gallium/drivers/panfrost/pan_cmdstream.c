@@ -1372,6 +1372,10 @@ panfrost_upload_sysvals(struct panfrost_batch *batch, void *ptr_cpu,
          uniforms[i].u[0] = batch->ctx->vertex_count;
          break;
 
+      case PAN_SYSVAL_GS_PARAMS:
+         uniforms[i].du[0] = batch->ctx->emu_params[st];
+         break;
+
       case PAN_SYSVAL_NUM_WORK_GROUPS:
          for (unsigned j = 0; j < 3; j++) {
             batch->num_wg_sysval[j] =

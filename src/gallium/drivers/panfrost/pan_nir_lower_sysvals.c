@@ -91,6 +91,9 @@ sysval_for_intrinsic(unsigned arch, nir_intrinsic_instr *intr, unsigned *offset)
    case nir_intrinsic_load_viewport_offset:
       return PAN_SYSVAL_VIEWPORT_OFFSET;
 
+   case nir_intrinsic_load_geometry_param_buffer_poly:
+      return PAN_SYSVAL_GS_PARAMS;
+
    case nir_intrinsic_load_num_workgroups:
       return PAN_SYSVAL_NUM_WORK_GROUPS;
 
