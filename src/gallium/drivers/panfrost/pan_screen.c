@@ -567,6 +567,11 @@ panfrost_init_shader_caps(struct panfrost_screen *screen)
       case MESA_SHADER_FRAGMENT:
       case MESA_SHADER_COMPUTE:
          break;
+      case MESA_SHADER_GEOMETRY:
+         /* Emulated as compute jobs on the Bifrost job manager (pan_gs.h). */
+         if (dev->arch == 6 || dev->arch == 7)
+            break;
+         continue;
       default:
          continue;
       }
@@ -904,6 +909,20 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
        * arb-provoking-vertex-render.
        */
       modes &= ~BITFIELD_BIT(MESA_PRIM_QUADS);
+   }
+
+   /* Adjacency only reaches the geometry shader emulation, which assembles
+    * the input primitives itself. */
+   if (dev->arch == 6 || dev->arch == 7) {
+      modes |= BITFIELD_BIT(MESA_PRIM_LINES_ADJACENCY) |
+               BITFIELD_BIT(MESA_PRIM_LINE_STRIP_ADJACENCY) |
+               BITFIELD_BIT(MESA_PRIM_TRIANGLES_ADJACENCY) |
+               BITFIELD_BIT(MESA_PRIM_TRIANGLE_STRIP_ADJACENCY);
+
+      caps->max_geometry_output_vertices = 256;
+      caps->max_geometry_total_output_components = 1024;
+      caps->max_gs_invocations = 32;
+      caps->max_vertex_streams = 1;
    }
 
    caps->supported_prim_modes =
