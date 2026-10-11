@@ -10,6 +10,7 @@
 
 #include "pan_fence.h"
 #include "pan_context.h"
+#include "pan_job.h"
 #include "pan_screen.h"
 
 #include "util/os_time.h"
@@ -42,6 +43,15 @@ panfrost_fence_finish(struct pipe_screen *pscreen, struct pipe_context *ctx,
    if (fence->signaled)
       return true;
 
+   /* If this fence was created with PIPE_FLUSH_DEFERRED, the batches have
+    * not been submitted yet. Flush them now so the syncobj will be signaled
+    * when the GPU work completes.
+    */
+   if (fence->unflushed_ctx) {
+      panfrost_flush_all_batches(fence->unflushed_ctx, "Deferred fence flush");
+      fence->unflushed_ctx = NULL;
+   }
+
    uint64_t abs_timeout = os_time_get_absolute_timeout(timeout);
    if (abs_timeout == OS_TIMEOUT_INFINITE)
       abs_timeout = INT64_MAX;
@@ -58,6 +68,12 @@ panfrost_fence_get_fd(struct pipe_screen *screen, struct pipe_fence_handle *f)
 {
    struct panfrost_device *dev = pan_device(screen);
    int fd = -1;
+
+   /* A deferred fence must be flushed before its syncobj can be exported. */
+   if (f->unflushed_ctx) {
+      panfrost_flush_all_batches(f->unflushed_ctx, "Deferred fence export");
+      f->unflushed_ctx = NULL;
+   }
 
    pan_kmod_sync_export_file(dev->kmod.dev, f->syncobj, &fd);
    return fd;

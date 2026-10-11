@@ -64,13 +64,23 @@ panfrost_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
    struct panfrost_context *ctx = pan_context(pipe);
    struct panfrost_device *dev = pan_device(pipe->screen);
 
-   /* Submit all pending jobs */
-   panfrost_flush_all_batches(ctx, "Gallium flush");
+   bool deferred = !!(flags & PIPE_FLUSH_DEFERRED);
+
+   /* Submit all pending jobs, unless the caller asked for a deferred flush
+    * (e.g. glFenceSync). In that case the fence will carry a reference to
+    * this context and the batches will be flushed on fence_finish or
+    * fence_server_sync.
+    */
+   if (!deferred)
+      panfrost_flush_all_batches(ctx, "Gallium flush");
 
    if (fence) {
       struct pipe_fence_handle *f = panfrost_fence_create(ctx);
       pipe->screen->fence_reference(pipe->screen, fence, NULL);
       *fence = f;
+
+      if (deferred && f)
+         f->unflushed_ctx = ctx;
    }
 
    if (dev->arch >= 10) {
@@ -1032,6 +1042,12 @@ panfrost_fence_server_sync(struct pipe_context *pctx,
    ASSERTED int ret;
    int fd = -1;
    assert(!value);
+
+   /* Flush deferred batches so the syncobj is valid for import. */
+   if (f->unflushed_ctx) {
+      panfrost_flush_all_batches(f->unflushed_ctx, "Deferred fence sync");
+      f->unflushed_ctx = NULL;
+   }
 
    ret = pan_kmod_sync_export_file(dev->kmod.dev, f->syncobj, &fd);
    assert(!ret);

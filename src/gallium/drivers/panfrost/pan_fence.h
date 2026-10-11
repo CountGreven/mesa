@@ -13,6 +13,12 @@ struct pipe_fence_handle {
    struct pipe_reference reference;
    uint32_t syncobj;
    bool signaled;
+
+   /* When PIPE_FLUSH_DEFERRED is used, the fence is created before the
+    * batches are submitted. This points to the context whose batches
+    * still need to be flushed. Cleared once flushed.
+    */
+   struct panfrost_context *unflushed_ctx;
 };
 
 void panfrost_fence_reference(struct pipe_screen *pscreen,
