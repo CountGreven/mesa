@@ -139,6 +139,12 @@ struct panfrost_context {
    /* Sync obj used to keep track of in-flight jobs. */
    uint32_t syncobj;
 
+   /* Deferred fences awaiting their context's work to be submitted. Each
+    * entry holds a reference so the fence survives until the syncobj is
+    * filled. Cleared by panfrost_flush_all_batches after a real submit.
+    */
+   struct util_dynarray pending_deferred_fences;
+
    /* Set of 32 batches. When the set is full, the LRU entry (the batch
     * with the smallest seqnum) is flushed to free a slot.
     */

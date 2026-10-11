@@ -15,6 +15,7 @@
 #include "util/u_pack_color.h"
 #include "pan_bo.h"
 #include "pan_context.h"
+#include "pan_fence.h"
 #include "pan_trace.h"
 #include "pan_util.h"
 
@@ -809,10 +810,8 @@ panfrost_flush_all_batches(struct panfrost_context *ctx, const char *reason)
       panfrost_batch_submit(ctx, batch);
 
    batch = panfrost_get_render_batch(ctx);
-   if (!batch)
-      return;
-
-   panfrost_batch_submit(ctx, batch);
+   if (batch)
+      panfrost_batch_submit(ctx, batch);
 
    for (unsigned i = 0; i < PAN_MAX_RENDER_BATCHES; i++) {
       if (ctx->batches.slots[i].seqnum)
@@ -821,6 +820,8 @@ panfrost_flush_all_batches(struct panfrost_context *ctx, const char *reason)
 
    if (pan_device(ctx->base.screen)->arch >= 10)
       u_trace_context_process(&ctx->trace_context, false);
+
+   panfrost_fill_deferred_fences(ctx);
 }
 
 void

@@ -38,10 +38,13 @@ struct pipe_fence_handle *panfrost_fence_from_fd(struct panfrost_context *ctx,
 
 struct pipe_fence_handle *panfrost_fence_create(struct panfrost_context *ctx);
 
-/* Re-export ctx->syncobj into the fence, replacing the stale snapshot taken
- * at creation time. Call after flushing the fence's deferred batches.
+/* Create a deferred fence with a new empty syncobj. The syncobj is filled
+ * when the context's work is submitted via panfrost_flush_all_batches.
  */
-struct panfrost_device;
-void panfrost_fence_reexport(struct panfrost_device *dev,
-                             struct panfrost_context *ctx,
-                             struct pipe_fence_handle *f);
+struct pipe_fence_handle *panfrost_fence_create_deferred(struct panfrost_context *ctx);
+
+/* Fill every pending deferred fence of the context with ctx->syncobj and
+ * clear the pending list. Called from panfrost_flush_all_batches after a
+ * real submit.
+ */
+void panfrost_fill_deferred_fences(struct panfrost_context *ctx);

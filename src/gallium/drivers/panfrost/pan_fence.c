@@ -34,59 +34,61 @@ panfrost_fence_reference(struct pipe_screen *pscreen,
 }
 
 /*
- * Re-export the context's current syncobj and swap it into the fence,
- * replacing the stale snapshot taken at creation time. This mirrors the
- * steps of panfrost_fence_create: export ctx->syncobj to a sync-file,
- * import it into a fresh syncobj, and destroy the old one.
- */
-void
-panfrost_fence_reexport(struct panfrost_device *dev,
-                        struct panfrost_context *ctx,
-                        struct pipe_fence_handle *f)
-{
-   int fd = -1, ret;
-
-   ret = pan_kmod_sync_export_file(dev->kmod.dev, ctx->syncobj, &fd);
-   if (ret || fd == -1) {
-      mesa_loge("re-export failed\n");
-      return;
-   }
-
-   uint32_t new_syncobj;
-   ret = pan_kmod_sync_create(dev->kmod.dev, 0, &new_syncobj);
-   if (ret) {
-      mesa_loge("create syncobj failed\n");
-      close(fd);
-      return;
-   }
-
-   ret = pan_kmod_sync_import_file(dev->kmod.dev, new_syncobj, fd);
-   close(fd);
-   if (ret) {
-      mesa_loge("import syncfile failed\n");
-      pan_kmod_sync_destroy(dev->kmod.dev, new_syncobj);
-      return;
-   }
-
-   pan_kmod_sync_destroy(dev->kmod.dev, f->syncobj);
-   f->syncobj = new_syncobj;
-}
-
-/*
- * Flush the deferred batches of the fence's own context, then re-export the
- * context's syncobj so the fence waits on the work that was just submitted
- * rather than the stale snapshot taken at creation time.
+ * Flush the deferred batches of the fence's own context, then fill the
+ * fence's empty syncobj with the context's now-updated syncobj so waiters
+ * block on the real GPU work.
  */
 static void
 panfrost_fence_flush_deferred(struct pipe_screen *pscreen,
                               struct pipe_fence_handle *f)
 {
-   struct panfrost_device *dev = pan_device(pscreen);
    struct panfrost_context *ctx = f->unflushed_ctx;
 
+   /* This fills the fence's syncobj via the context's pending-fence list. */
    panfrost_flush_all_batches(ctx, "Deferred fence flush");
-   panfrost_fence_reexport(dev, ctx, f);
    f->unflushed_ctx = NULL;
+}
+
+/*
+ * Fill every deferred fence this context is holding pending, then clear the
+ * list. Called from panfrost_flush_all_batches after the context's work has
+ * actually been submitted, so ctx->syncobj now tracks that work.
+ */
+void
+panfrost_fill_deferred_fences(struct panfrost_context *ctx)
+{
+   struct panfrost_device *dev = pan_device(ctx->base.screen);
+   unsigned count = util_dynarray_num_elements(&ctx->pending_deferred_fences,
+                                               struct pipe_fence_handle *);
+
+   if (!count)
+      return;
+
+   int fd = -1, ret;
+
+   ret = pan_kmod_sync_export_file(dev->kmod.dev, ctx->syncobj, &fd);
+   if (ret || fd == -1) {
+      mesa_loge("export failed\n");
+      return;
+   }
+
+   util_dynarray_foreach(&ctx->pending_deferred_fences,
+                         struct pipe_fence_handle *, fp) {
+      struct pipe_fence_handle *f = *fp;
+
+      ret = pan_kmod_sync_import_file(dev->kmod.dev, f->syncobj, fd);
+      if (ret)
+         mesa_loge("import syncfile failed\n");
+
+      f->unflushed_ctx = NULL;
+
+      /* Drop the reference the pending list was holding. */
+      struct pipe_fence_handle *tmp = f;
+      panfrost_fence_reference(ctx->base.screen, &tmp, NULL);
+   }
+
+   close(fd);
+   util_dynarray_init(&ctx->pending_deferred_fences, ctx);
 }
 
 bool
@@ -139,8 +141,7 @@ panfrost_fence_get_fd(struct pipe_screen *screen, struct pipe_fence_handle *f)
 
    /* A deferred fence can't be exported until its batches have been
     * submitted, and get_fd has no context to check against. Flush its own
-    * context and re-export the syncobj so the exported sync-file tracks the
-    * fenced work rather than the stale snapshot.
+    * context, which fills the fence's syncobj via the pending-fence list.
     */
    if (f->unflushed_ctx)
       panfrost_fence_flush_deferred(screen, f);
@@ -213,6 +214,34 @@ panfrost_fence_create(struct panfrost_context *ctx)
       panfrost_fence_from_fd(ctx, fd, PIPE_FD_TYPE_NATIVE_SYNC);
 
    close(fd);
+
+   return f;
+}
+
+/*
+ * Create a deferred fence: a fence with a NEW EMPTY syncobj. The syncobj
+ * will be filled with ctx->syncobj when the context's work is submitted
+ * (via panfrost_flush_all_batches). This is the iris-style approach that
+ * makes WAIT_FOR_SUBMIT work correctly for cross-context waiters.
+ */
+struct pipe_fence_handle *
+panfrost_fence_create_deferred(struct panfrost_context *ctx)
+{
+   struct panfrost_device *dev = pan_device(ctx->base.screen);
+
+   struct pipe_fence_handle *f = calloc(1, sizeof(*f));
+   if (!f)
+      return NULL;
+
+   int ret = pan_kmod_sync_create(dev->kmod.dev, 0, &f->syncobj);
+   if (ret) {
+      mesa_loge("create syncobj failed\n");
+      free(f);
+      return NULL;
+   }
+
+   pipe_reference_init(&f->reference, 1);
+   f->unflushed_ctx = ctx;
 
    return f;
 }

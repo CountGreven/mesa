@@ -75,12 +75,29 @@ panfrost_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
       panfrost_flush_all_batches(ctx, "Gallium flush");
 
    if (fence) {
-      struct pipe_fence_handle *f = panfrost_fence_create(ctx);
+      struct pipe_fence_handle *f;
+
+      if (deferred) {
+         /* Deferred: create a fence with a new empty syncobj. It will be
+          * filled when panfrost_flush_all_batches submits this context's
+          * work. Add a reference to the pending list so the fence survives
+          * until then.
+          */
+         f = panfrost_fence_create_deferred(ctx);
+
+         if (f) {
+            struct pipe_fence_handle **slot =
+               util_dynarray_grow(&ctx->pending_deferred_fences,
+                                   struct pipe_fence_handle *, 1);
+            *slot = f;
+            pipe_reference(NULL, &f->reference); /* list holds a ref */
+         }
+      } else {
+         f = panfrost_fence_create(ctx);
+      }
+
       pipe->screen->fence_reference(pipe->screen, fence, NULL);
       *fence = f;
-
-      if (deferred && f)
-         f->unflushed_ctx = ctx;
    }
 
    if (dev->arch >= 10) {
@@ -643,6 +660,14 @@ panfrost_destroy(struct pipe_context *pipe)
       panfrost->in_sync_fd = -1;
    }
 
+   /* Drop references held by the pending deferred fence list. */
+   util_dynarray_foreach(&panfrost->pending_deferred_fences,
+                         struct pipe_fence_handle *, fp) {
+      struct pipe_fence_handle *tmp = *fp;
+      panfrost_fence_reference(pipe->screen, &tmp, NULL);
+   }
+   util_dynarray_fini(&panfrost->pending_deferred_fences);
+
    pan_kmod_sync_destroy(dev->kmod.dev, panfrost->syncobj);
    ralloc_free(pipe);
 }
@@ -1043,16 +1068,13 @@ panfrost_fence_server_sync(struct pipe_context *pctx,
    int fd = -1;
    assert(!value);
 
-   /* Only flush when the caller's context matches the one the fence was
-    * created with; poking at another context's batches isn't safe because it
-    * may be bound to a different thread. After flushing, re-export the
-    * context's syncobj so the accumulated sync-file tracks the fenced work
-    * rather than the stale snapshot taken at creation time.
+   /* Flush deferred batches when the caller's context matches the one the
+    * fence was created with. panfrost_flush_all_batches fills the fence's
+    * syncobj via the pending-fence list, so no separate re-export is needed.
     */
    if (f->unflushed_ctx) {
       if ((struct pipe_context *)f->unflushed_ctx == pctx) {
          panfrost_flush_all_batches(f->unflushed_ctx, "Deferred fence sync");
-         panfrost_fence_reexport(dev, f->unflushed_ctx, f);
          f->unflushed_ctx = NULL;
       } else {
          mesa_logw("server sync on unflushed fence from another context\n");
@@ -1205,6 +1227,7 @@ panfrost_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 
    util_dynarray_init(&ctx->bo_access, ctx);
    util_dynarray_init(&ctx->global_buffers, ctx);
+   util_dynarray_init(&ctx->pending_deferred_fences, ctx);
 
    /* Sync object/FD used for NATIVE_FENCE_FD. */
    ctx->in_sync_fd = -1;
