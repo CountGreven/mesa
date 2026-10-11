@@ -36,6 +36,10 @@ struct pan_compile_inputs {
    uint32_t gpu_variant;
    bool is_blend, is_blit;
    bool no_idvs;
+
+   /* A geometry shader follows: the vertex shader keeps gl_Position in clip
+    * space and its varyings as written (pan_gs.h). */
+   bool vs_keep_clip_space;
    uint32_t view_mask;
 
    /* Number of colour buffers gl_FragColor broadcasts to.  Only useful for
