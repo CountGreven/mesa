@@ -1043,10 +1043,20 @@ panfrost_fence_server_sync(struct pipe_context *pctx,
    int fd = -1;
    assert(!value);
 
-   /* Flush deferred batches so the syncobj is valid for import. */
+   /* Only flush when the caller's context matches the one the fence was
+    * created with; poking at another context's batches isn't safe because it
+    * may be bound to a different thread. After flushing, re-export the
+    * context's syncobj so the accumulated sync-file tracks the fenced work
+    * rather than the stale snapshot taken at creation time.
+    */
    if (f->unflushed_ctx) {
-      panfrost_flush_all_batches(f->unflushed_ctx, "Deferred fence sync");
-      f->unflushed_ctx = NULL;
+      if ((struct pipe_context *)f->unflushed_ctx == pctx) {
+         panfrost_flush_all_batches(f->unflushed_ctx, "Deferred fence sync");
+         panfrost_fence_reexport(dev, f->unflushed_ctx, f);
+         f->unflushed_ctx = NULL;
+      } else {
+         mesa_logw("server sync on unflushed fence from another context\n");
+      }
    }
 
    ret = pan_kmod_sync_export_file(dev->kmod.dev, f->syncobj, &fd);

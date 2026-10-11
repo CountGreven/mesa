@@ -37,3 +37,11 @@ struct pipe_fence_handle *panfrost_fence_from_fd(struct panfrost_context *ctx,
                                                  enum pipe_fd_type type);
 
 struct pipe_fence_handle *panfrost_fence_create(struct panfrost_context *ctx);
+
+/* Re-export ctx->syncobj into the fence, replacing the stale snapshot taken
+ * at creation time. Call after flushing the fence's deferred batches.
+ */
+struct panfrost_device;
+void panfrost_fence_reexport(struct panfrost_device *dev,
+                             struct panfrost_context *ctx,
+                             struct pipe_fence_handle *f);

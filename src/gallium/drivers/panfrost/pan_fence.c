@@ -33,23 +33,91 @@ panfrost_fence_reference(struct pipe_screen *pscreen,
    *ptr = fence;
 }
 
+/*
+ * Re-export the context's current syncobj and swap it into the fence,
+ * replacing the stale snapshot taken at creation time. This mirrors the
+ * steps of panfrost_fence_create: export ctx->syncobj to a sync-file,
+ * import it into a fresh syncobj, and destroy the old one.
+ */
+void
+panfrost_fence_reexport(struct panfrost_device *dev,
+                        struct panfrost_context *ctx,
+                        struct pipe_fence_handle *f)
+{
+   int fd = -1, ret;
+
+   ret = pan_kmod_sync_export_file(dev->kmod.dev, ctx->syncobj, &fd);
+   if (ret || fd == -1) {
+      mesa_loge("re-export failed\n");
+      return;
+   }
+
+   uint32_t new_syncobj;
+   ret = pan_kmod_sync_create(dev->kmod.dev, 0, &new_syncobj);
+   if (ret) {
+      mesa_loge("create syncobj failed\n");
+      close(fd);
+      return;
+   }
+
+   ret = pan_kmod_sync_import_file(dev->kmod.dev, new_syncobj, fd);
+   close(fd);
+   if (ret) {
+      mesa_loge("import syncfile failed\n");
+      pan_kmod_sync_destroy(dev->kmod.dev, new_syncobj);
+      return;
+   }
+
+   pan_kmod_sync_destroy(dev->kmod.dev, f->syncobj);
+   f->syncobj = new_syncobj;
+}
+
+/*
+ * Flush the deferred batches of the fence's own context, then re-export the
+ * context's syncobj so the fence waits on the work that was just submitted
+ * rather than the stale snapshot taken at creation time.
+ */
+static void
+panfrost_fence_flush_deferred(struct pipe_screen *pscreen,
+                              struct pipe_fence_handle *f)
+{
+   struct panfrost_device *dev = pan_device(pscreen);
+   struct panfrost_context *ctx = f->unflushed_ctx;
+
+   panfrost_flush_all_batches(ctx, "Deferred fence flush");
+   panfrost_fence_reexport(dev, ctx, f);
+   f->unflushed_ctx = NULL;
+}
+
 bool
 panfrost_fence_finish(struct pipe_screen *pscreen, struct pipe_context *ctx,
                       struct pipe_fence_handle *fence, uint64_t timeout)
 {
    struct panfrost_device *dev = pan_device(pscreen);
+   unsigned flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL;
    int ret;
 
    if (fence->signaled)
       return true;
 
-   /* If this fence was created with PIPE_FLUSH_DEFERRED, the batches have
-    * not been submitted yet. Flush them now so the syncobj will be signaled
-    * when the GPU work completes.
+   /* Only flush when the caller's context matches the one the fence was
+    * created with. Poking at another context's internals isn't safe because
+    * it may be bound to a different thread.
     */
+   if (ctx && ctx == (struct pipe_context *)fence->unflushed_ctx)
+      panfrost_fence_flush_deferred(pscreen, fence);
+
    if (fence->unflushed_ctx) {
-      panfrost_flush_all_batches(fence->unflushed_ctx, "Deferred fence flush");
-      fence->unflushed_ctx = NULL;
+      /* The fence is still unflushed and belongs to another (or no) context.
+       * We can't safely flush it here. A zero timeout can't wait for work
+       * that hasn't been submitted, so report it as not signaled. Otherwise
+       * use WAIT_FOR_SUBMIT to block until the other thread submits the
+       * work, mirroring iris_fence_finish.
+       */
+      if (timeout == 0)
+         return false;
+
+      flags |= DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
    }
 
    uint64_t abs_timeout = os_time_get_absolute_timeout(timeout);
@@ -57,7 +125,7 @@ panfrost_fence_finish(struct pipe_screen *pscreen, struct pipe_context *ctx,
       abs_timeout = INT64_MAX;
 
    ret = pan_kmod_sync_wait(dev->kmod.dev, &fence->syncobj, 1, abs_timeout,
-                            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+                            flags, NULL);
 
    fence->signaled = (ret >= 0);
    return fence->signaled;
@@ -69,11 +137,13 @@ panfrost_fence_get_fd(struct pipe_screen *screen, struct pipe_fence_handle *f)
    struct panfrost_device *dev = pan_device(screen);
    int fd = -1;
 
-   /* A deferred fence must be flushed before its syncobj can be exported. */
-   if (f->unflushed_ctx) {
-      panfrost_flush_all_batches(f->unflushed_ctx, "Deferred fence export");
-      f->unflushed_ctx = NULL;
-   }
+   /* A deferred fence can't be exported until its batches have been
+    * submitted, and get_fd has no context to check against. Flush its own
+    * context and re-export the syncobj so the exported sync-file tracks the
+    * fenced work rather than the stale snapshot.
+    */
+   if (f->unflushed_ctx)
+      panfrost_fence_flush_deferred(screen, f);
 
    pan_kmod_sync_export_file(dev->kmod.dev, f->syncobj, &fd);
    return fd;
