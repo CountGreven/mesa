@@ -12,6 +12,7 @@
 #include "pan_mod_conv_cso.h"
 #include "pan_blend_cso.h"
 #include "pan_earlyzs.h"
+#include "pan_gs.h"
 #include "pan_encoder.h"
 #include "pan_job.h"
 #include "pan_resource.h"
@@ -171,6 +172,11 @@ struct panfrost_context {
    bool active_queries;
    uint64_t prims_generated;
    uint64_t tf_prims_generated;
+
+   /* GPU addresses of the current draw's struct pan_gs_params, by the stage
+    * the emulation runs (geometry). */
+   uint64_t emu_params[MESA_SHADER_STAGES];
+
    uint64_t draw_calls;
    struct panfrost_query *occlusion_query;
 
@@ -331,6 +337,8 @@ enum {
    PAN_SYSVAL_NUM_VERTICES = 18,
    PAN_SYSVAL_PRINTF_BUFFER = 19,
    PAN_SYSVAL_IMAGE_SAMPLES = 20,
+   /* Address of the draw's struct pan_gs_params (geometry shader emulation). */
+   PAN_SYSVAL_GS_PARAMS = 22,
 };
 
 #define PAN_TXS_SYSVAL_ID(texidx, dim, is_array)                               \
@@ -409,9 +417,34 @@ struct panfrost_vs_key {
    uint32_t noperspective_varyings;
 };
 
+/* One draw through the geometry shader emulation (pan_gs.h): what the vertex,
+ * compute and tiler jobs point at. */
+struct panfrost_gs_draw {
+   /* The vertex job: its varying buffers and ATTRIBUTE descriptors. */
+   uint64_t vs_bufs, vs_producer;
+   /* The tiler job: the emulation's buffers, the fragment shader's
+    * descriptors into them, positions, point sizes and indices. */
+   uint64_t gs_bufs, fs_consumer;
+   uint64_t out_pos, out_psiz, out_index;
+   uint32_t out_verts, index_count;
+   /* Compute workgroups of PAN_GS_WORKGROUP_SIZE. */
+   uint32_t wg;
+   enum mesa_prim out_prim;
+   /* A VIEWPORT descriptor covering every viewport, when the shader picks
+    * them per primitive; 0 for the batch's own. */
+   uint64_t viewport;
+};
+
+struct panfrost_gs_key {
+   /* As panfrost_vs_key::noperspective_varyings, for the geometry shader's
+    * outputs. */
+   uint32_t noperspective_varyings;
+};
+
 struct panfrost_shader_key {
    union {
       struct panfrost_vs_key vs;
+      struct panfrost_gs_key gs;
       struct panfrost_fs_key fs;
    };
 };
@@ -471,6 +504,9 @@ struct panfrost_uncompiled_shader {
 
    /* If gl_FragColor was lowered, we need to optimize the stores later */
    bool fragcolor_lowered;
+
+   /* Geometry shaders: the emulation's shape (pan_gs.h). */
+   struct pan_gs_info gs;
 };
 
 /* The binary artefacts of compiling a shader. This differs from
