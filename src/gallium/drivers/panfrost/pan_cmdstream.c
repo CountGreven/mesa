@@ -16,6 +16,7 @@
 #include "util/u_helpers.h"
 #include "util/u_memory.h"
 #include "util/u_prim.h"
+#include "util/u_prim_restart.h"
 #include "util/u_sample_positions.h"
 #include "util/u_vbuf.h"
 #include "util/u_viewport.h"
@@ -3423,6 +3424,306 @@ panfrost_draw_get_vertex_count(struct panfrost_batch *batch,
    return vertex_count;
 }
 
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+/*
+ * Geometry shaders, emulated as a compute job between the vertex and tiler jobs (pan_gs.h).
+ */
+static enum pan_gs_topology
+panfrost_gs_topology(enum mesa_prim mode)
+{
+   switch (mode) {
+   case MESA_PRIM_LINE_STRIP:
+   case MESA_PRIM_TRIANGLE_STRIP:
+   case MESA_PRIM_LINE_STRIP_ADJACENCY:
+      return PAN_GS_TOPO_STRIP;
+   case MESA_PRIM_TRIANGLE_FAN:
+      return PAN_GS_TOPO_FAN;
+   case MESA_PRIM_LINE_LOOP:
+      return PAN_GS_TOPO_LOOP;
+   case MESA_PRIM_TRIANGLE_STRIP_ADJACENCY:
+      return PAN_GS_TOPO_TRI_STRIP_ADJ;
+   default:
+      return PAN_GS_TOPO_LIST;
+   }
+}
+
+static unsigned
+panfrost_gs_prims_per_instance(enum mesa_prim mode, unsigned n, unsigned vpp)
+{
+   switch (panfrost_gs_topology(mode)) {
+   case PAN_GS_TOPO_STRIP:
+      return n >= vpp ? n - (vpp - 1) : 0;
+   case PAN_GS_TOPO_FAN:
+      return n >= 3 ? n - 2 : 0;
+   case PAN_GS_TOPO_LOOP:
+      return n >= 2 ? n : 0;
+   case PAN_GS_TOPO_TRI_STRIP_ADJ:
+      return n >= 6 ? (n - 4) / 2 : 0;
+   default:
+      return n / vpp;
+   }
+}
+
+static mali_pixel_format
+panfrost_gs_rgba32f(void)
+{
+   mali_pixel_format format = MALI_RGBA32F << 12;
+#if PAN_ARCH <= 6
+   format |= pan_get_default_swizzle(4);
+#endif
+   return format;
+}
+
+/* The vertex job's side: buffers for everything the vertex shader writes, positions unsnapped in
+ * clip space, and the slot table the emulation reads them with. */
+static bool
+panfrost_gs_emit_vs_varyings(struct panfrost_batch *batch, struct pan_gs_params *params,
+                             struct panfrost_gs_draw *out)
+{
+   struct panfrost_context *ctx = batch->ctx;
+   struct panfrost_device *dev = pan_device(ctx->base.screen);
+   struct panfrost_compiled_shader *vs = ctx->prog[MESA_SHADER_VERTEX];
+   const struct pan_varying_layout *layout = &vs->info.varyings.formats;
+   pan_varying_layout_require_layout(layout);
+
+   const unsigned count = ctx->padded_count * ctx->instance_count;
+   unsigned present = BITFIELD_BIT(PAN_VARY_GENERAL) | BITFIELD_BIT(PAN_VARY_POSITION);
+   if (vs->info.vs.writes_point_size)
+      present |= BITFIELD_BIT(PAN_VARY_PSIZ);
+
+   struct pan_ptr bufs =
+      pan_pool_alloc_desc_array(&batch->pool.base, util_bitcount(present) + 1, ATTRIBUTE_BUFFER);
+   struct pan_ptr descs =
+      pan_pool_alloc_desc_array(&batch->pool.base, MAX2(layout->count, 1), ATTRIBUTE);
+   struct pan_ptr table = pan_pool_alloc_aligned(&batch->pool.base, 64 * 4, 4);
+   if (!bufs.cpu || !descs.cpu || !table.cpu)
+      return false;
+
+   struct mali_attribute_buffer_packed *b = bufs.cpu;
+   memset(b + util_bitcount(present), 0, sizeof(*b));
+
+   const unsigned stride = layout->generic_size_B;
+   if (stride) {
+      params->in_general = panfrost_bi_emit_varyings_buffer(
+         batch, &b[pan_varying_index(present, PAN_VARY_GENERAL)], stride, count);
+   } else {
+      memset(&b[pan_varying_index(present, PAN_VARY_GENERAL)], 0, sizeof(*b));
+   }
+   params->in_general_stride = stride;
+   params->in_pos = panfrost_bi_emit_varyings_buffer(
+      batch, &b[pan_varying_index(present, PAN_VARY_POSITION)], 16, count);
+   if (present & BITFIELD_BIT(PAN_VARY_PSIZ)) {
+      params->in_psiz = panfrost_bi_emit_varyings_buffer(
+         batch, &b[pan_varying_index(present, PAN_VARY_PSIZ)], 2, count);
+   }
+
+   uint32_t *offsets = table.cpu;
+   for (unsigned i = 0; i < 64; i++)
+      offsets[i] = PAN_GS_SLOT_UNUSED;
+
+   /* Every slot the vertex shader writes is kept: the geometry shader may read any of them. */
+   struct mali_attribute_packed *d = descs.cpu;
+   for (unsigned i = 0; i < layout->count; i++) {
+      const struct pan_varying_slot *slot = pan_varying_layout_slot_at(layout, i);
+      if (!slot) {
+         pan_emit_vary(dev, &d[i], 0, (MALI_CONSTANT << 12), 0);
+         continue;
+      }
+
+      if (slot->location == VARYING_SLOT_POS) {
+         pan_emit_vary(dev, &d[i], pan_varying_index(present, PAN_VARY_POSITION),
+                       panfrost_gs_rgba32f(), 0);
+      } else if (slot->location == VARYING_SLOT_PSIZ) {
+         pan_emit_vary_special(dev, &d[i], present, PAN_VARY_PSIZ);
+      } else if (slot->section == PAN_VARYING_SECTION_GENERIC) {
+         enum pipe_format format = pan_varying_format(slot->alu_type, slot->ncomps);
+         pan_emit_vary(dev, &d[i], 0, GENX(pan_format_from_pipe_format)(format)->hw,
+                       slot->offset);
+         if (slot->location < 64) {
+            offsets[slot->location] =
+               slot->offset |
+               (nir_alu_type_get_type_size(slot->alu_type) == 16 ? PAN_GS_IN_16BIT : 0);
+         }
+      } else {
+         pan_emit_vary(dev, &d[i], 0, (MALI_CONSTANT << 12), 0);
+      }
+   }
+
+   params->in_offsets = table.gpu;
+   out->vs_bufs = bufs.gpu;
+   out->vs_producer = layout->count ? descs.gpu : 0;
+   return true;
+}
+
+/* The tiler job's side: the emulation's buffers, sized for every invocation filling its whole
+ * slot, one dead vertex past the end, and the fragment shader's descriptors into them. */
+static bool
+panfrost_gs_emit_out_varyings(struct panfrost_batch *batch, const struct pan_gs_info *gsi,
+                              struct pan_gs_params *params, struct panfrost_gs_draw *out)
+{
+   struct panfrost_context *ctx = batch->ctx;
+   struct panfrost_device *dev = pan_device(ctx->base.screen);
+   struct panfrost_compiled_shader *fs = ctx->prog[MESA_SHADER_FRAGMENT];
+
+   unsigned present = BITFIELD_BIT(PAN_VARY_GENERAL) | BITFIELD_BIT(PAN_VARY_POSITION);
+   if (gsi->writes_psiz)
+      present |= BITFIELD_BIT(PAN_VARY_PSIZ);
+
+   struct pan_ptr bufs =
+      pan_pool_alloc_desc_array(&batch->pool.base, util_bitcount(present) + 1, ATTRIBUTE_BUFFER);
+
+   /* Not the varying pool: the vertex shader reaches that through the varying unit, and plain
+    * compute stores into it do not land (panvk measured it). */
+   struct pan_ptr pos = pan_pool_alloc_aligned(&batch->pool.base, out->out_verts * 16, 64);
+   struct pan_ptr gen =
+      pan_pool_alloc_aligned(&batch->pool.base, out->out_verts * gsi->out_stride, 64);
+   struct pan_ptr psiz = {0};
+   if (gsi->writes_psiz)
+      psiz = pan_pool_alloc_aligned(&batch->pool.base, ALIGN_POT(out->out_verts * 2, 4), 64);
+   struct pan_ptr idx = pan_pool_alloc_aligned(&batch->pool.base, out->index_count * 4, 64);
+   if (!bufs.cpu || !pos.cpu || !gen.cpu || !idx.cpu || (gsi->writes_psiz && !psiz.cpu))
+      return false;
+
+   struct mali_attribute_buffer_packed *b = bufs.cpu;
+   memset(b + util_bitcount(present), 0, sizeof(*b));
+   pan_pack(&b[pan_varying_index(present, PAN_VARY_GENERAL)], ATTRIBUTE_BUFFER, cfg) {
+      cfg.stride = gsi->out_stride;
+      cfg.size = out->out_verts * gsi->out_stride;
+      cfg.pointer = gen.gpu;
+   }
+   pan_pack(&b[pan_varying_index(present, PAN_VARY_POSITION)], ATTRIBUTE_BUFFER, cfg) {
+      cfg.stride = 16;
+      cfg.size = out->out_verts * 16;
+      cfg.pointer = pos.gpu;
+   }
+   if (gsi->writes_psiz) {
+      pan_pack(&b[pan_varying_index(present, PAN_VARY_PSIZ)], ATTRIBUTE_BUFFER, cfg) {
+         cfg.stride = 2;
+         cfg.size = out->out_verts * 2;
+         cfg.pointer = psiz.gpu;
+      }
+   }
+
+   /* The dead vertex, far outside any viewport. */
+   const unsigned dead = out->out_verts - 1;
+   float *dead_pos = (float *)pos.cpu + dead * 4;
+   dead_pos[0] = dead_pos[1] = -1.0e6f;
+   dead_pos[2] = 0.0f;
+   dead_pos[3] = 1.0f;
+
+   uint64_t consumer = 0;
+   if (fs) {
+      const struct pan_varying_layout *fs_layout = &fs->info.varyings.formats;
+      pan_varying_layout_require_format(fs_layout);
+
+      if (fs_layout->count) {
+         struct pan_ptr descs =
+            pan_pool_alloc_desc_array(&batch->pool.base, fs_layout->count, ATTRIBUTE);
+         if (!descs.cpu)
+            return false;
+
+         struct mali_attribute_packed *d = descs.cpu;
+         for (unsigned i = 0; i < fs_layout->count; i++) {
+            const struct pan_varying_slot *slot = pan_varying_layout_slot_at(fs_layout, i);
+            if (!slot) {
+               pan_emit_vary(dev, &d[i], 0, (MALI_CONSTANT << 12), 0);
+               continue;
+            }
+
+            const uint32_t offset = pan_gs_out_offset(gsi, slot->location);
+            enum pipe_format format = PIPE_FORMAT_NONE;
+            if (offset != PAN_GS_SLOT_UNUSED) {
+               nir_alu_type base = nir_alu_type_get_base_type(slot->alu_type);
+               format = pan_varying_format(base | 32, slot->ncomps);
+            }
+
+            panfrost_bi_emit_varying(dev, &d[i], slot->location, format, present, 0,
+                                     offset == PAN_GS_SLOT_UNUSED ? 0 : offset,
+                                     PAN_VARY_FRAGCOORD);
+         }
+         consumer = descs.gpu;
+      }
+   }
+
+   params->out_pos = pos.gpu;
+   params->out_psiz = psiz.gpu;
+   params->out_general = gen.gpu;
+   params->out_index = idx.gpu;
+   params->dead_vertex = dead;
+
+   out->gs_bufs = bufs.gpu;
+   out->fs_consumer = consumer;
+   out->out_pos = pos.gpu;
+   out->out_psiz = psiz.gpu;
+   out->out_index = idx.gpu;
+   return true;
+}
+
+/* Everything the three jobs need, and the draw's pan_gs_params for the GS_PARAMS sysval. Returns
+ * false when the draw has no complete input primitive, or an allocation failed. */
+static bool
+panfrost_gs_prepare(struct panfrost_batch *batch, const struct pipe_draw_info *info,
+                    const struct pipe_draw_start_count_bias *draw, struct panfrost_gs_draw *out)
+{
+   struct panfrost_context *ctx = batch->ctx;
+   const struct pan_gs_info *gsi = &ctx->uncompiled[MESA_SHADER_GEOMETRY]->gs;
+
+   const unsigned vpp = MAX2(gsi->input_verts, 1);
+   const unsigned ppi = panfrost_gs_prims_per_instance(info->mode, draw->count, vpp);
+   const uint64_t in_prims = (uint64_t)ppi * info->instance_count;
+   const uint64_t invocations = in_prims * gsi->invocations;
+   if (!invocations || !gsi->max_verts || !gsi->max_prims)
+      return false;
+
+   const uint64_t out_verts = invocations * gsi->max_verts + 1;
+   const uint64_t index_count = invocations * gsi->max_prims * gsi->output_verts;
+   /* The worst case has to fit a 32-bit index and a sane allocation. */
+   if (out_verts * (16 + gsi->out_stride) > (512ull << 20) || index_count > UINT32_MAX) {
+      mesa_loge("geometry shader draw too large to emulate: %" PRIu64 " invocations",
+                invocations);
+      return false;
+   }
+
+   memset(out, 0, sizeof(*out));
+   out->out_verts = out_verts;
+   out->index_count = index_count;
+   out->wg = DIV_ROUND_UP(invocations, PAN_GS_WORKGROUP_SIZE);
+   out->out_prim = gsi->output_verts == 3   ? MESA_PRIM_TRIANGLES
+                   : gsi->output_verts == 2 ? MESA_PRIM_LINES
+                                            : MESA_PRIM_POINTS;
+
+   struct pan_ptr p = pan_pool_alloc_aligned(&batch->pool.base, sizeof(struct pan_gs_params), 16);
+   if (!p.cpu)
+      return false;
+   struct pan_gs_params *params = p.cpu;
+   memset(params, 0, sizeof(*params));
+
+   if (!panfrost_gs_emit_vs_varyings(batch, params, out) ||
+       !panfrost_gs_emit_out_varyings(batch, gsi, params, out))
+      return false;
+
+   /* A shader picking viewports needs the per-viewport transforms, the fragment-side clip and a
+    * tiler viewport covering them all (panfrost_gs_emit_viewports) — not ported yet. */
+   if (gsi->writes_viewport) {
+      perf_debug(ctx, "geometry shaders writing gl_ViewportIndex are not emulated yet");
+      return false;
+   }
+
+   params->index_buf = info->index_size ? batch->indices : 0;
+   params->index_size = info->index_size;
+   params->topology = panfrost_gs_topology(info->mode);
+   params->prims_per_instance = ppi;
+   params->instance_stride = info->instance_count > 1 ? ctx->padded_count : 0;
+   params->num_input_prims = in_prims;
+   params->index_bias = info->index_size ? ctx->offset_start - draw->index_bias : 0;
+   params->vertex_count = draw->count;
+   params->flatshade_first = ctx->rasterizer->base.flatshade_first;
+
+   ctx->emu_params[MESA_SHADER_GEOMETRY] = p.gpu;
+   return true;
+}
+#endif
+
 static void
 panfrost_single_draw_direct(struct panfrost_batch *batch,
                             const struct pipe_draw_info *info,
@@ -3434,7 +3735,22 @@ panfrost_single_draw_direct(struct panfrost_batch *batch,
 
    struct panfrost_context *ctx = batch->ctx;
 
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+   struct panfrost_uncompiled_shader *gs = ctx->uncompiled[MESA_SHADER_GEOMETRY];
+   struct panfrost_gs_draw gs_draw;
+   struct pipe_grid_info gs_grid = {.block = {PAN_GS_WORKGROUP_SIZE, 1, 1}, .work_dim = 1};
+
+   /* The tiler draws what the geometry shader emits. */
+   enum mesa_prim raster_prim = info->mode;
+   if (gs) {
+      raster_prim = gs->gs.output_verts == 3   ? MESA_PRIM_TRIANGLES
+                    : gs->gs.output_verts == 2 ? MESA_PRIM_LINES
+                                               : MESA_PRIM_POINTS;
+   }
+   panfrost_update_active_prim(ctx, raster_prim);
+#else
    panfrost_update_active_prim(ctx, info->mode);
+#endif
 
    /* Take into account a negative bias */
    ctx->vertex_count =
@@ -3452,10 +3768,42 @@ panfrost_single_draw_direct(struct panfrost_batch *batch,
 
    panfrost_statistics_record(ctx, info, draw);
 
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+   if (gs) {
+      /* The vertex shader's descriptor the generic check also wants is
+       * emitted below. */
+      if (ctx->rasterizer->base.rasterizer_discard ||
+          batch->scissor_culls_everything ||
+          !panfrost_gs_prepare(batch, info, draw, &gs_draw))
+         return;
+
+      /* The emulation's compute sysvals, and its parameters every draw. */
+      gs_grid.grid[0] = gs_draw.wg;
+      gs_grid.grid[1] = gs_grid.grid[2] = 1;
+      ctx->compute_grid = &gs_grid;
+      ctx->dirty_shader[MESA_SHADER_GEOMETRY] |= PAN_DIRTY_STAGE_CONST;
+   }
+#endif
+
    panfrost_update_state_3d(batch);
    panfrost_update_shader_state(batch, MESA_SHADER_VERTEX);
    panfrost_update_shader_state(batch, MESA_SHADER_FRAGMENT);
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+   if (gs) {
+      panfrost_update_shader_state(batch, MESA_SHADER_GEOMETRY);
+      ctx->compute_grid = NULL;
+   }
+#endif
    panfrost_clean_state_3d(ctx);
+
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+   if (gs) {
+      if (vertex_count > 0 && batch->rsd[MESA_SHADER_VERTEX])
+         GENX(jm_launch_draw_gs)(batch, info, vertex_count, &gs_draw);
+      batch->draw_count++;
+      return;
+   }
+#endif
 
    if (ctx->uncompiled[MESA_SHADER_VERTEX]->xfb) {
       panfrost_launch_xfb(batch, info, draw->count);
@@ -3575,6 +3923,7 @@ panfrost_draw_indirect(struct pipe_context *pipe,
    struct panfrost_context *ctx = pan_context(pipe);
 
    if (!PAN_GPU_SUPPORTS_DRAW_INDIRECT ||
+       ctx->uncompiled[MESA_SHADER_GEOMETRY] ||
        panfrost_occlusion_query_active(ctx) ||
        ctx->streamout.num_targets) {
       util_draw_indirect(pipe, info, drawid_offset, indirect);
@@ -3670,6 +4019,29 @@ panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       return;
 
    ctx->draw_calls++;
+
+   /* Adjacency is only meaningful to a geometry shader, and only the
+    * emulation (pan_gs.h) can assemble it. */
+   if (info->mode >= MESA_PRIM_LINES_ADJACENCY &&
+       info->mode <= MESA_PRIM_TRIANGLE_STRIP_ADJACENCY &&
+       !ctx->uncompiled[MESA_SHADER_GEOMETRY])
+      return;
+
+   /* The emulation assembles primitives itself and does not see restarts:
+    * split the draw at them on the CPU. */
+   if (ctx->uncompiled[MESA_SHADER_GEOMETRY] && info->primitive_restart &&
+       info->index_size && !(indirect && indirect->buffer) &&
+       info->mode != MESA_PRIM_POINTS && info->mode != MESA_PRIM_LINES &&
+       info->mode != MESA_PRIM_TRIANGLES &&
+       info->mode != MESA_PRIM_LINES_ADJACENCY &&
+       info->mode != MESA_PRIM_TRIANGLES_ADJACENCY) {
+      for (unsigned i = 0; i < num_draws; i++) {
+         util_draw_vbo_without_prim_restart(
+            pipe, info, drawid_offset + (info->increment_draw_id ? i : 0), NULL,
+            &draws[i]);
+      }
+      return;
+   }
 
    if (indirect && indirect->buffer) {
       assert(num_draws == 1);

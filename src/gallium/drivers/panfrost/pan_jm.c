@@ -1024,6 +1024,139 @@ GENX(jm_launch_draw)(struct panfrost_batch *batch,
 #endif
 }
 
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+/*
+ * A draw through the geometry shader emulation (pan_gs.h): the vertex job writes the vertex
+ * shader's varyings, a compute job runs the geometry shader over them, and the tiler job draws
+ * the indexed list it produced.
+ */
+void
+GENX(jm_launch_draw_gs)(struct panfrost_batch *batch,
+                        const struct pipe_draw_info *info, unsigned vertex_count,
+                        const struct panfrost_gs_draw *gs)
+{
+   PAN_TRACE_FUNC(PAN_TRACE_GL_JM);
+
+   struct panfrost_context *ctx = batch->ctx;
+   struct pipe_rasterizer_state *rast = &ctx->rasterizer->base;
+
+   struct mali_invocation_packed invocation;
+   if (info->instance_count > 1) {
+      pan_pack_work_groups_compute(&invocation, 1, vertex_count,
+                                   info->instance_count, 1, 1, 1, true, false);
+   } else {
+      pan_pack(&invocation, INVOCATION, cfg) {
+         cfg.invocations = vertex_count - 1;
+         cfg.size_y_shift = 0;
+         cfg.size_z_shift = 0;
+         cfg.workgroups_x_shift = 0;
+         cfg.workgroups_y_shift = 0;
+         cfg.workgroups_z_shift = 32;
+         cfg.thread_group_split = MALI_SPLIT_MIN_EFFICIENT;
+      }
+   }
+
+   struct pan_ptr vertex = pan_pool_alloc_desc(&batch->pool.base, COMPUTE_JOB);
+   struct pan_ptr compute = pan_pool_alloc_desc(&batch->pool.base, COMPUTE_JOB);
+   struct pan_ptr tiler = pan_pool_alloc_desc(&batch->pool.base, TILER_JOB);
+   if (!vertex.cpu || !compute.cpu || !tiler.cpu) {
+      mesa_loge("jm_launch_draw_gs failed");
+      return;
+   }
+
+   uint64_t saved_vs = batch->varyings.vs, saved_fs = batch->varyings.fs;
+   uint64_t saved_bufs = batch->varyings.bufs, saved_pos = batch->varyings.pos;
+   uint64_t saved_psiz = batch->varyings.psiz;
+
+   /* The vertex shader writes the emulation's input. */
+   batch->varyings.vs = gs->vs_producer;
+   batch->varyings.bufs = gs->vs_bufs;
+   jm_emit_vertex_job(batch, info, &invocation, vertex.cpu);
+
+   /* The geometry shader, one invocation per input primitive and gl_InvocationID. */
+   pan_pack_work_groups_compute(pan_section_ptr(compute.cpu, COMPUTE_JOB, INVOCATION),
+                                gs->wg, 1, 1, PAN_GS_WORKGROUP_SIZE, 1, 1, false, false);
+   pan_section_pack(compute.cpu, COMPUTE_JOB, PARAMETERS, cfg) {
+      cfg.job_task_split = util_logbase2_ceil(PAN_GS_WORKGROUP_SIZE + 1) + 2;
+   }
+   pan_section_pack(compute.cpu, COMPUTE_JOB, DRAW, cfg) {
+      cfg.state = batch->rsd[MESA_SHADER_GEOMETRY];
+      cfg.attributes = batch->attribs[MESA_SHADER_GEOMETRY];
+      cfg.attribute_buffers = batch->attrib_bufs[MESA_SHADER_GEOMETRY];
+      cfg.thread_storage = batch->tls.gpu;
+      cfg.uniform_buffers = batch->uniform_buffers[MESA_SHADER_GEOMETRY];
+      cfg.push_uniforms = batch->push_uniforms[MESA_SHADER_GEOMETRY];
+      cfg.textures = batch->textures[MESA_SHADER_GEOMETRY];
+      cfg.samplers = batch->samplers[MESA_SHADER_GEOMETRY];
+   }
+
+   /* The tiler draws the emulation's output: an indexed list over its own buffers, with no
+    * offset or instancing of its own. */
+   batch->varyings.fs = gs->fs_consumer;
+   batch->varyings.bufs = gs->gs_bufs;
+   batch->varyings.pos = gs->out_pos;
+   batch->varyings.psiz = gs->out_psiz;
+
+   pan_pack_work_groups_compute(pan_section_ptr(tiler.cpu, TILER_JOB, INVOCATION), 1,
+                                gs->out_verts, 1, 1, 1, 1, true, false);
+
+   const enum mesa_prim prim = gs->out_prim;
+   pan_section_pack(tiler.cpu, TILER_JOB, PRIMITIVE, cfg) {
+      cfg.draw_mode = pan_draw_mode(prim);
+      if (panfrost_writes_point_size(ctx))
+         cfg.point_size_array_format = MALI_POINT_SIZE_ARRAY_FORMAT_FP16;
+      cfg.first_provoking_vertex =
+         prim == MESA_PRIM_LINES ? true : rast->flatshade_first;
+      cfg.job_task_split = 6;
+      cfg.low_depth_cull = rast->depth_clip_near;
+      cfg.high_depth_cull = rast->depth_clip_far;
+      cfg.index_count = gs->index_count;
+      cfg.index_type = MALI_INDEX_TYPE_UINT32;
+      cfg.indices = gs->out_index;
+      cfg.base_vertex_offset = 0;
+      cfg.secondary_shader = false;
+   }
+
+   pan_section_pack(tiler.cpu, TILER_JOB, TILER, cfg) {
+      cfg.address = jm_emit_tiler_desc(batch);
+   }
+   pan_section_pack(tiler.cpu, TILER_JOB, PADDING, cfg)
+      ;
+
+   const unsigned saved_offset = ctx->offset_start;
+   const unsigned saved_instances = ctx->instance_count;
+   const uint64_t saved_viewport = batch->viewport;
+   ctx->offset_start = 0;
+   ctx->instance_count = 1;
+   if (gs->viewport)
+      batch->viewport = gs->viewport;
+   jm_emit_tiler_draw(pan_section_ptr(tiler.cpu, TILER_JOB, DRAW), batch, true,
+                      prim, NULL);
+   ctx->offset_start = saved_offset;
+   ctx->instance_count = saved_instances;
+   batch->viewport = saved_viewport;
+
+   panfrost_emit_primitive_size(ctx, prim == MESA_PRIM_POINTS, gs->out_psiz,
+                                pan_section_ptr(tiler.cpu, TILER_JOB, PRIMITIVE_SIZE));
+
+   batch->varyings.vs = saved_vs;
+   batch->varyings.fs = saved_fs;
+   batch->varyings.bufs = saved_bufs;
+   batch->varyings.pos = saved_pos;
+   batch->varyings.psiz = saved_psiz;
+
+   /* A job dependency orders the jobs but does not make the vertex job's varying writes
+    * visible to the compute job: that takes the barrier. Prefetch is suppressed because the
+    * tiler's inputs only exist once the compute job ran. */
+   unsigned v = pan_jc_add_job(&batch->jm.jobs.vtc_jc, MALI_JOB_TYPE_VERTEX, false,
+                               false, 0, 0, &vertex, false);
+   unsigned c = pan_jc_add_job(&batch->jm.jobs.vtc_jc, MALI_JOB_TYPE_COMPUTE, true,
+                               true, v, 0, &compute, false);
+   pan_jc_add_job(&batch->jm.jobs.vtc_jc, MALI_JOB_TYPE_TILER, false, false, c, 0,
+                  &tiler, false);
+}
+#endif
+
 void
 GENX(jm_launch_draw_indirect)(struct panfrost_batch *batch,
                               const struct pipe_draw_info *info,
