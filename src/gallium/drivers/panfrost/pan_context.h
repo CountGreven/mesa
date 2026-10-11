@@ -392,6 +392,14 @@ struct panfrost_fs_key {
 
    bool line_smooth;
 
+   /* The last vertex stage writes gl_ViewportIndex: discard outside that
+    * viewport (pan_gs.h). */
+   bool viewport_clip;
+
+   /* The last vertex stage is emulated: gl_Layer and gl_ViewportIndex come
+    * in the emulation's slots (PAN_GS_VIEWPORT_SLOT). */
+   bool emulated_producer;
+
    /* The VS varying layout determines how the FS is compiled (LD_VAR vs
     * LD_VAR_BUF and byte offsets). Include the full layout in the key so
     * the disk cache and in-memory variant cache correctly distinguish FS
@@ -409,6 +417,10 @@ struct panfrost_vs_key {
    /* Bit mask of varyings in the linked FS that use noperspective
     * interpolation, starting at VARYING_SLOT_VAR0 */
    uint32_t noperspective_varyings;
+
+   /* A geometry shader follows: gl_Position stays in clip space, and the
+    * varyings are written as they are (pan_gs.h). */
+   bool keep_clip_space;
 };
 
 /* One draw through the geometry shader emulation (pan_gs.h): what the vertex,

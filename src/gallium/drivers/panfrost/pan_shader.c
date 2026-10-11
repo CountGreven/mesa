@@ -104,6 +104,18 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
 
    nir_shader *s = nir_shader_clone(NULL, ir);
 
+   /* A geometry shader runs as a compute job between the vertex and tiler
+    * jobs (pan_gs.h), and is compiled as the compute shader it becomes.
+    * pan_nir_lower_gs runs nir_lower_gs_intrinsics (count_primitives |
+    * count_vertices_per_primitive | overwrite_incomplete) itself, which our
+    * tree otherwise only asks for in radv.
+    */
+   if (s->info.stage == MESA_SHADER_GEOMETRY) {
+      struct pan_gs_info gs;
+      pan_gs_gather_info(s, &gs);
+      NIR_PASS(_, s, pan_nir_lower_gs, &gs, key->gs.noperspective_varyings);
+   }
+
    /* While graphics shaders are preprocessed at CSO create time, compute
     * kernels are not preprocessed until they're cloned since the driver does
     * not get ownership of the NIR from compute CSOs. Do this preprocessing now.
@@ -121,6 +133,10 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
 
    /* Lower this early so the backends don't have to worry about it */
    if (s->info.stage == MESA_SHADER_VERTEX) {
+      /* A geometry shader feeds the emulation: keep clip space and the
+       * varyings as written (pan_gs.h). */
+      inputs.vs_keep_clip_space = key->vs.keep_clip_space;
+
       /* No IDVS for internal XFB shaders */
       inputs.no_idvs = s->info.has_transform_feedback_varyings;
 
@@ -298,7 +314,26 @@ panfrost_build_vs_key(struct panfrost_context *ctx,
    struct panfrost_uncompiled_shader *fs = ctx->uncompiled[MESA_SHADER_FRAGMENT];
 
    assert(fs != NULL && "too early");
+
+   /* With a geometry shader, the vertex shader feeds the emulation, which
+    * applies the viewport transform and noperspective itself. */
+   if (ctx->uncompiled[MESA_SHADER_GEOMETRY] ||
+       uncompiled->nir->info.next_stage == MESA_SHADER_GEOMETRY) {
+      key->keep_clip_space = true;
+      return;
+   }
+
    key->noperspective_varyings = fs->noperspective_varyings;
+}
+
+static void
+panfrost_build_gs_key(struct panfrost_context *ctx,
+                      struct panfrost_gs_key *key)
+{
+   struct panfrost_uncompiled_shader *fs = ctx->uncompiled[MESA_SHADER_FRAGMENT];
+
+   if (fs)
+      key->noperspective_varyings = fs->noperspective_varyings;
 }
 
 static void
@@ -326,11 +361,17 @@ panfrost_build_fs_key(struct panfrost_context *ctx,
    if (rast) {
       key->clip_plane_enable = rast->clip_plane_enable;
 
+      struct panfrost_uncompiled_shader *gs = ctx->uncompiled[MESA_SHADER_GEOMETRY];
+      key->viewport_clip = gs && gs->gs.writes_viewport;
+      key->emulated_producer = gs != NULL;
+
       if (u_reduced_prim(ctx->active_prim) == MESA_PRIM_LINES)
          key->line_smooth = rast->line_smooth;
    }
 
-   if (!key->clip_plane_enable)
+   /* Behind a geometry shader the varyings come from the emulation's own
+    * layout, which the fragment shader reads through attribute descriptors. */
+   if (!key->clip_plane_enable && !ctx->uncompiled[MESA_SHADER_GEOMETRY])
       key->vs_varying_layout = uncompiled->vs_varying_layout;
 
    if (dev->arch <= 5) {
@@ -361,6 +402,9 @@ panfrost_build_key(struct panfrost_context *ctx,
       break;
    case MESA_SHADER_FRAGMENT:
       panfrost_build_fs_key(ctx, &key->fs, uncompiled);
+      break;
+   case MESA_SHADER_GEOMETRY:
+      panfrost_build_gs_key(ctx, &key->gs);
       break;
    default:
       break;
@@ -463,6 +507,23 @@ panfrost_bind_fs_state(struct pipe_context *pctx, void *hwcso)
    /* Vertex shaders are linked with fragment shaders */
    struct panfrost_context *ctx = pan_context(pctx);
    panfrost_update_shader_variant(ctx, MESA_SHADER_VERTEX);
+   panfrost_update_shader_variant(ctx, MESA_SHADER_GEOMETRY);
+}
+
+static void
+panfrost_bind_gs_state(struct pipe_context *pctx, void *hwcso)
+{
+   panfrost_bind_shader_state(pctx, hwcso, MESA_SHADER_GEOMETRY);
+
+   /* The vertex shader keeps clip space for it, and the fragment shader
+    * reads its layout. */
+   struct panfrost_context *ctx = pan_context(pctx);
+   ctx->prog[MESA_SHADER_VERTEX] = NULL;
+   ctx->dirty_shader[MESA_SHADER_VERTEX] |= PAN_DIRTY_STAGE_SHADER;
+   panfrost_update_shader_variant(ctx, MESA_SHADER_VERTEX);
+   ctx->prog[MESA_SHADER_FRAGMENT] = NULL;
+   ctx->dirty_shader[MESA_SHADER_FRAGMENT] |= PAN_DIRTY_STAGE_SHADER;
+   panfrost_update_shader_variant(ctx, MESA_SHADER_FRAGMENT);
 }
 
 static unsigned
@@ -475,6 +536,13 @@ static struct panfrost_shader_key
 panfrost_default_shader_key(struct panfrost_uncompiled_shader *so)
 {
    struct panfrost_shader_key key = {0};
+
+   /* A vertex shader linked to a geometry shader only ever feeds the
+    * emulation, and the linker may have trimmed gl_Position to what the
+    * geometry shader reads: it is never viewport-transformed. */
+   if (so->nir->info.stage == MESA_SHADER_VERTEX &&
+       so->nir->info.next_stage == MESA_SHADER_GEOMETRY)
+      key.vs.keep_clip_space = true;
 
    if (so->nir->info.stage == MESA_SHADER_FRAGMENT) {
       /* gl_FragColor lowering needs the number of colour buffers on desktop
@@ -592,6 +660,9 @@ panfrost_create_shader_state(struct pipe_context *pctx,
          NIR_PASS(_, nir, panfrost_nir_lower_pls, pan_screen(pctx->screen));
    }
 
+   if (nir->info.stage == MESA_SHADER_GEOMETRY)
+      pan_gs_gather_info(nir, &so->gs);
+
    if (nir->info.stage == MESA_SHADER_VERTEX) {
       struct pan_varying_layout *varying_layout = &so->vs_varying_layout;
       pan_varying_collect_formats(varying_layout, nir,
@@ -605,7 +676,7 @@ panfrost_create_shader_state(struct pipe_context *pctx,
     */
    struct panfrost_context *ctx = pan_context(pctx);
 
-   if (so->nir->xfb_info) {
+   if (so->nir->xfb_info && nir->info.stage == MESA_SHADER_VERTEX) {
       so->xfb = calloc(1, sizeof(struct panfrost_compiled_shader));
       so->xfb->key.vs.is_xfb = true;
 
@@ -674,6 +745,11 @@ panfrost_link_shader(struct pipe_context *pctx, void** handles)
    struct panfrost_uncompiled_shader *fs = handles[MESA_SHADER_FRAGMENT];
 
    if (!fs || fs->nir->info.separate_shader)
+      return;
+
+   /* Behind a geometry shader the fragment shader reads the emulation's
+    * layout through attribute descriptors: nothing to link here. */
+   if (handles[MESA_SHADER_GEOMETRY])
       return;
 
    /* We only handle VS and FS for now, it's not clear how varying layout will
@@ -760,6 +836,10 @@ panfrost_shader_context_init(struct pipe_context *pctx)
    pctx->create_vs_state = panfrost_create_shader_state;
    pctx->delete_vs_state = panfrost_delete_shader_state;
    pctx->bind_vs_state = panfrost_bind_vs_state;
+
+   pctx->create_gs_state = panfrost_create_shader_state;
+   pctx->delete_gs_state = panfrost_delete_shader_state;
+   pctx->bind_gs_state = panfrost_bind_gs_state;
 
    pctx->create_fs_state = panfrost_create_shader_state;
    pctx->delete_fs_state = panfrost_delete_shader_state;
