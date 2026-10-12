@@ -107,6 +107,18 @@ struct panfrost_query {
    /* Memory for the GPU to writeback the value of the query */
    struct pipe_resource *rsrc;
 
+   /* GPU address of the zeroed counter this PRIMITIVES_GENERATED query's GS
+    * compute job atomic-adds generated primitives to. Captured in begin_query;
+    * re-reading rsrc later could hit a shadowed/reallocated BO. 0 = never started. */
+   uint64_t prims_gpu;
+
+   /* True once this PRIMITIVES_GENERATED query's interval has counted primitives
+    * on the GPU (emulated GS atomic adds): after the first such draw the result
+    * must be read back from prims_gpu. Until then (no GS, or every GS draw
+    * discarded before the compute job) the CPU-side end - start snapshot,
+    * updated in end_query, is the answer. */
+   bool prims_gpu_scored;
+
    /* Whether an occlusion query is for a MSAA framebuffer */
    bool msaa;
 };
@@ -238,6 +250,7 @@ struct panfrost_context {
    unsigned min_samples;
 
    struct panfrost_query *cond_query;
+   struct panfrost_query *primitives_generated_query;
    bool cond_cond;
    enum pipe_render_cond_flag cond_mode;
 
@@ -439,6 +452,10 @@ struct panfrost_gs_draw {
    /* A VIEWPORT descriptor covering every viewport, when the shader picks
     * them per primitive; 0 for the batch's own. */
    uint64_t viewport;
+   /* The compute job's params tick the active PRIMITIVES_GENERATED query's GPU
+    * counter (panfrost_gs_prepare): once the job launches, the query's result
+    * must come from the counter, not the CPU snapshot. */
+   bool gpu_counts_prims;
 };
 
 struct panfrost_gs_key {
