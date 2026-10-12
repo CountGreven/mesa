@@ -100,6 +100,7 @@ struct lower_gs_state {
    nir_def *prim_id, *invocation_id, *instance;
    nir_def *out_vtx_base, *out_idx_base;
    nir_variable *prims_written;
+   nir_def *prims_written_addr;
 
    /* The current value of every output slot, 4 x 32-bit. */
    nir_variable *outputs[64];
@@ -480,6 +481,12 @@ lower_end_primitive(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_s
    nir_pop_loop(b, NULL);
 
    nir_store_var(b, st->prims_written, nir_iadd(b, prim_base, nprims), 1);
+   /* Add primitives generated to the GPU counter if query is active */
+   nir_push_if(b, nir_ine_imm(b, st->prims_written_addr, 0));
+   {
+      nir_global_atomic(b, 32, st->prims_written_addr, nprims, .atomic_op = nir_atomic_op_iadd);
+   }
+   nir_pop_if(b, NULL);
 }
 
 /* Every index slot this invocation owns starts at the dead vertex (pan_gs_params::dead_vertex),
@@ -588,6 +595,7 @@ pan_nir_lower_gs(nir_shader *nir, const struct pan_gs_info *info, uint32_t noper
    st.out_index = PARAM64(&b, &st, out_index);
    st.flatshade_first = PARAM32(&b, &st, flatshade_first);
    st.dead_vertex = PARAM32(&b, &st, dead_vertex);
+   st.prims_written_addr = PARAM64(&b, &st, prims_written_addr);
    nir_def *num_prims = PARAM32(&b, &st, num_input_prims);
 
    /* One invocation per (input primitive, gl_InvocationID) pair, each with its own slots. */

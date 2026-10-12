@@ -696,6 +696,12 @@ panfrost_create_query(struct pipe_context *pipe, unsigned type, unsigned index)
    case PIPE_QUERY_TIME_ELAPSED:
       size = sizeof(uint64_t) * 2;
       break;
+   case PIPE_QUERY_PRIMITIVES_GENERATED:
+      /* One uint32 the emulated geometry shader atomic-adds into (pan_gs.h's
+       * prims_written_addr). Re-zeroed per begin_query, so the counter is
+       * exactly this query's interval. */
+      size = sizeof(uint32_t);
+      break;
    default:
       break;
    }
@@ -781,7 +787,24 @@ panfrost_begin_query(struct pipe_context *pipe, struct pipe_query *q)
        * shaders.. */
 
    case PIPE_QUERY_PRIMITIVES_GENERATED:
+      /* CPU snapshot: answers queries with no GPU-scored draw in the interval
+       * (no geometry shader bound, or every GS draw discarded before its
+       * compute job ran). end_query closes the snapshot. */
       query->start = ctx->prims_generated;
+
+      /* GPU counter: zero the interval and pin the BO's GPU address in the
+       * query (the occlusion path above does the same dance). GS compute jobs
+       * atomic-add into prims_gpu long after this; re-deriving it from rsrc at
+       * emit time could catch a shadowed/reallocated BO. */
+      if (query->rsrc) {
+         const uint32_t zero = 0;
+         pipe_buffer_write(pipe, query->rsrc, 0, sizeof(zero), &zero);
+         query->prims_gpu = pan_resource(query->rsrc)->bo->ptr.gpu;
+      } else {
+         query->prims_gpu = 0;
+      }
+      query->prims_gpu_scored = false;
+      ctx->primitives_generated_query = query;
       break;
    case PIPE_QUERY_PRIMITIVES_EMITTED:
       query->start = ctx->tf_prims_generated;
@@ -826,6 +849,7 @@ panfrost_end_query(struct pipe_context *pipe, struct pipe_query *q)
       break;
    }
    case PIPE_QUERY_PRIMITIVES_GENERATED:
+      ctx->primitives_generated_query = NULL;
       query->end = ctx->prims_generated;
       break;
    case PIPE_QUERY_PRIMITIVES_EMITTED:
@@ -899,6 +923,25 @@ panfrost_get_query_result(struct pipe_context *pipe, struct pipe_query *q,
    }
 
    case PIPE_QUERY_PRIMITIVES_GENERATED:
+      if (query->prims_gpu_scored && query->rsrc) {
+         /* A GS compute job atomic-added this interval's output primitives on
+          * the GPU: read its counter, ordered like the occlusion result path. */
+         struct panfrost_resource *qrsrc = pan_resource(query->rsrc);
+         panfrost_flush_all_batches(ctx, "Primitives generated query");
+         panfrost_flush_writer(ctx, qrsrc, "Primitives generated query");
+         panfrost_resource_wait(qrsrc, ctx, INT64_MAX, false);
+
+         if (panfrost_bo_mmap(qrsrc->bo))
+            break;
+
+         vresult->u64 = *(const uint32_t *)qrsrc->bo->ptr.cpu;
+         break;
+      }
+      /* No GPU-scored draw: the CPU snapshot from begin/end_query answers. */
+      panfrost_flush_all_batches(ctx, "Primitive count query");
+      vresult->u64 = query->end - query->start;
+      break;
+
    case PIPE_QUERY_PRIMITIVES_EMITTED:
       panfrost_flush_all_batches(ctx, "Primitive count query");
       vresult->u64 = query->end - query->start;

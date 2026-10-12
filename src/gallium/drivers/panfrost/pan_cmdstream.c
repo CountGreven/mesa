@@ -3719,6 +3719,25 @@ panfrost_gs_prepare(struct panfrost_batch *batch, const struct pipe_draw_info *i
    params->vertex_count = draw->count;
    params->flatshade_first = ctx->rasterizer->base.flatshade_first;
 
+   /* GPU-side counting for an active PRIMITIVES_GENERATED query (pan_context.c):
+    * the compute job atomic-adds its output primitives at the counter address
+    * the query pinned in begin_query. Suspended queries (internal rendering)
+    * must not tick the counter, matching panfrost_statistics_record's gate.
+    * Reaching here already survived gs_prepare's early-outs (discard, empty
+    * scissor, allocation); the launch site below flips gpu_counts_prims into
+    * the query as soon as the job is queued. */
+   struct panfrost_query *pgq = ctx->primitives_generated_query;
+   if (pgq && pgq->prims_gpu && ctx->active_queries) {
+      params->prims_written_addr = pgq->prims_gpu;
+      out->gpu_counts_prims = true;
+
+      /* Track the counter as a write of this batch, like the occlusion rsrc in
+       * pan_jm.c/pan_csf.c: orders the zeroing writes and any readers before
+       * these atomics, lets get_query_result() flush this batch as the writer,
+       * and keeps the BO alive until the job retires. */
+      panfrost_batch_write_rsrc(batch, pan_resource(pgq->rsrc));
+   }
+
    ctx->emu_params[MESA_SHADER_GEOMETRY] = p.gpu;
    return true;
 }
@@ -3798,8 +3817,15 @@ panfrost_single_draw_direct(struct panfrost_batch *batch,
 
 #if PAN_ARCH == 6 || PAN_ARCH == 7
    if (gs) {
-      if (vertex_count > 0 && batch->rsd[MESA_SHADER_VERTEX])
+      if (vertex_count > 0 && batch->rsd[MESA_SHADER_VERTEX]) {
          GENX(jm_launch_draw_gs)(batch, info, vertex_count, &gs_draw);
+
+         /* The armed compute job is queued: the interval now owns a GPU sum,
+          * so get_query_result() reads the counter BO instead of the stale CPU
+          * input-prims snapshot. */
+         if (gs_draw.gpu_counts_prims && ctx->primitives_generated_query)
+            ctx->primitives_generated_query->prims_gpu_scored = true;
+      }
       batch->draw_count++;
       return;
    }
