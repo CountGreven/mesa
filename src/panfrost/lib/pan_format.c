@@ -495,7 +495,7 @@ const struct pan_format GENX(pan_pipe_format)[PIPE_FORMAT_COUNT] = {
    FMT(R16G16B16_UINT,          RGB16UI,         RGB1, L, V_____),
    FMT(R4G4B4A4_UNORM,          RGBA4_UNORM,     RGBA, L, VTR___),
    FMT(B4G4R4A4_UNORM,          RGBA4_UNORM,     BGRA, L, VTR___),
-   FMT(A4R4G4B4_UNORM,          RGBA4_UNORM,     ARGB, L, VTR___),
+   FMT(A4R4G4B4_UNORM,          RGBA4_UNORM,     GBAR, L, VTR___),
    FMT(A4B4G4R4_UNORM,          RGBA4_UNORM,     ABGR, L, VTR___),
    FMT(R16G16B16A16_UNORM,      RGBA16_UNORM,    RGBA, L, VTR_IB),
 #if PAN_ARCH >= 11
