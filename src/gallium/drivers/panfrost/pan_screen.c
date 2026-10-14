@@ -600,6 +600,10 @@ panfrost_init_shader_caps(struct panfrost_screen *screen)
       /* Used as ABI on Midgard */
       caps->max_inputs = dev->arch >= 9 ? 32 : 16;
       caps->max_outputs = i == MESA_SHADER_FRAGMENT ? 8 : PIPE_MAX_ATTRIBS;
+      /* The geometry stage feeds the fragment shader directly: no more
+       * outputs than it can read. */
+      if (i == MESA_SHADER_GEOMETRY)
+         caps->max_outputs = caps->max_inputs;
       caps->max_temps = 256; /* arbitrary */
       caps->max_const_buffer0_size = 16 * 1024 * sizeof(float);
       STATIC_ASSERT(PAN_MAX_CONST_BUFFERS < 0x100);
