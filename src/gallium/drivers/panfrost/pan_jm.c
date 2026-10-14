@@ -1101,9 +1101,15 @@ GENX(jm_launch_draw_gs)(struct panfrost_batch *batch,
                                 gs->out_verts, 1, 1, 1, 1, true, false);
 
    const enum mesa_prim prim = gs->out_prim;
+
+   /* Point sizes come from the geometry shader, not the vertex shader: only
+    * its own gl_PointSize writes fill out_psiz (allocated only then).
+    */
+   const bool psiz_array = prim == MESA_PRIM_POINTS && gs->out_psiz;
+
    pan_section_pack(tiler.cpu, TILER_JOB, PRIMITIVE, cfg) {
       cfg.draw_mode = pan_draw_mode(prim);
-      if (panfrost_writes_point_size(ctx))
+      if (psiz_array)
          cfg.point_size_array_format = MALI_POINT_SIZE_ARRAY_FORMAT_FP16;
       cfg.first_provoking_vertex =
          prim == MESA_PRIM_LINES ? true : rast->flatshade_first;
@@ -1136,8 +1142,13 @@ GENX(jm_launch_draw_gs)(struct panfrost_batch *batch,
    ctx->instance_count = saved_instances;
    batch->viewport = saved_viewport;
 
-   panfrost_emit_primitive_size(ctx, prim == MESA_PRIM_POINTS, gs->out_psiz,
-                                pan_section_ptr(tiler.cpu, TILER_JOB, PRIMITIVE_SIZE));
+   pan_section_pack(tiler.cpu, TILER_JOB, PRIMITIVE_SIZE, cfg) {
+      if (psiz_array)
+         cfg.size_array = gs->out_psiz;
+      else
+         cfg.fixed_sized = prim == MESA_PRIM_POINTS ? rast->point_size
+                                                     : rast->line_width;
+   }
 
    batch->varyings.vs = saved_vs;
    batch->varyings.fs = saved_fs;
