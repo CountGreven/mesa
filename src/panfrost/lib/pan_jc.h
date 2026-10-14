@@ -22,6 +22,12 @@ struct pan_jc {
    /* A CPU-side pointer to the previous job for next_job linking */
    struct mali_job_header_packed *prev_job;
 
+   /* Make the next job a barrier job. A barrier job only waits for earlier
+    * jobs, so work that later jobs must observe (an in-chain buffer copy)
+    * sets this to order those jobs after it.
+    */
+   bool barrier_next;
+
    /* A CPU-side pointer to the first tiler job for dep updates when
     * injecting a reload tiler job.
     */
@@ -153,6 +159,11 @@ pan_jc_add_job(struct pan_jc *jc, enum mali_job_type type, bool barrier,
          global_dep = jc->tiler_dep;
       else if (PAN_ARCH <= 5)
          global_dep = jc->write_value_index;
+   }
+
+   if (!inject) {
+      barrier |= jc->barrier_next;
+      jc->barrier_next = false;
    }
 
    /* Assign the index */
