@@ -187,20 +187,29 @@ gs_input_record(nir_builder *b, struct lower_gs_state *st, nir_def *i)
    nir_def *list = vpp ? nir_iadd(b, nir_imul_imm(b, p, vpp), i)
                        : nir_iadd(b, nir_imul(b, p, st->vpp_dyn), i);
 
-   /* STRIP: p + i. An odd triangle of a strip takes p, p + 2, p + 1: GL's order for it keeps the
-    * winding reversed, which is all the geometry shader can see. */
+   /* The provoking vertex decides the order of an odd strip triangle and of a fan triangle, so
+    * that it stays where the convention puts it (as on asahi):
+    *    STRIP, odd p:  first: p, p + 2, p + 1   last: p + 1, p, p + 2
+    *    FAN:           first: p + 1, p + 2, 0   last: 0, p + 1, p + 2 */
+   nir_def *first_pv = nir_ine_imm(b, st->flatshade_first, 0);
+
+   /* STRIP: p + i, an odd triangle reordered. */
    nir_def *strip_i = i;
    if (vpp == 3) {
       nir_def *odd = nir_ine_imm(b, nir_iand_imm(b, p, 1), 0);
-      nir_def *swapped = nir_bcsel(b, nir_ieq_imm(b, i, 1), nir_imm_int(b, 2),
-                                   nir_bcsel(b, nir_ieq_imm(b, i, 2), nir_imm_int(b, 1), i));
-      strip_i = nir_bcsel(b, odd, swapped, i);
+      nir_def *odd_first = nir_bcsel(b, nir_ieq_imm(b, i, 1), nir_imm_int(b, 2),
+                                     nir_bcsel(b, nir_ieq_imm(b, i, 2), nir_imm_int(b, 1), i));
+      nir_def *odd_last = nir_bcsel(b, nir_ieq_imm(b, i, 0), nir_imm_int(b, 1),
+                                    nir_bcsel(b, nir_ieq_imm(b, i, 1), nir_imm_int(b, 0), i));
+      strip_i = nir_bcsel(b, odd, nir_bcsel(b, first_pv, odd_first, odd_last), i);
    }
    nir_def *strip = nir_iadd(b, p, strip_i);
 
-   /* FAN: p + 1, p + 2, 0 */
-   nir_def *fan =
+   /* FAN */
+   nir_def *fan_first =
       nir_bcsel(b, nir_ieq_imm(b, i, 2), nir_imm_int(b, 0), nir_iadd(b, p, nir_iadd_imm(b, i, 1)));
+   nir_def *fan_last = nir_bcsel(b, nir_ieq_imm(b, i, 0), nir_imm_int(b, 0), nir_iadd(b, p, i));
+   nir_def *fan = nir_bcsel(b, first_pv, fan_first, fan_last);
 
    /* LOOP: p + i, wrapping to 0 after the last vertex. */
    nir_def *loop_v = nir_iadd(b, p, i);
