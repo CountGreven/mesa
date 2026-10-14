@@ -97,7 +97,9 @@ struct lower_gs_state {
    /* Vertices per input primitive when info->input_verts is 0 (a tess control patch). */
    nir_def *vpp_dyn;
 
-   nir_def *prim_id, *invocation_id, *instance;
+   /* The input primitive within its instance (primitive assembly), and gl_PrimitiveIDIn, which
+    * continues across the pieces of a draw split at its restarts. */
+   nir_def *prim_id, *prim_id_in, *invocation_id, *instance;
    nir_def *out_vtx_base, *out_idx_base;
    nir_variable *prims_written;
    nir_def *prims_written_addr;
@@ -565,7 +567,7 @@ lower_gs_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       nir_instr_remove(&intr->instr);
       return true;
    case nir_intrinsic_load_primitive_id:
-      nir_def_replace(&intr->def, st->prim_id);
+      nir_def_replace(&intr->def, st->prim_id_in);
       return true;
    case nir_intrinsic_load_invocation_id:
       nir_def_replace(&intr->def, st->invocation_id);
@@ -645,8 +647,8 @@ pan_nir_lower_gs(nir_shader *nir, const struct pan_gs_info *info, uint32_t noper
    /* gl_PrimitiveIDIn restarts with every instance. */
    nir_def *ppi = nir_umax(&b, st.prims_per_instance, nir_imm_int(&b, 1));
    st.instance = nir_udiv(&b, prim_global, ppi);
-   st.prim_id = nir_iadd(&b, nir_isub(&b, prim_global, nir_imul(&b, st.instance, ppi)),
-                         PARAM32(&b, &st, prim_id_base));
+   st.prim_id = nir_isub(&b, prim_global, nir_imul(&b, st.instance, ppi));
+   st.prim_id_in = nir_iadd(&b, st.prim_id, PARAM32(&b, &st, prim_id_base));
 
    emit_degenerate_fill(&b, &st);
 
