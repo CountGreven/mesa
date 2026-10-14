@@ -583,10 +583,19 @@ panvk_draw_emit_attrib(const struct panvk_draw_data *draw,
       if (helper_attrib_info != NULL) {
          helper_attrib_info->base_offset = offset;
          helper_attrib_info->stride = per_instance ? buf_info->stride : 0;
+         helper_attrib_info->offset_start_stride =
+            per_instance && buf_info->divisor ? buf_info->stride : 0;
       } else {
          cfg.offset = offset;
          if (per_instance)
             cfg.offset += draw->info.instance.base * buf_info->stride;
+
+         /* The hardware adds offset_start to the index of per-instance
+          * attributes too, after the divisor. Cancel it on instanced draws
+          * (a zero divisor uses a zero-stride buffer and is unaffected).
+          */
+         if (per_instance && buf_info->divisor && draw->info.instance.count > 1)
+            cfg.offset -= draw->info.vertex.raw_offset * buf_info->stride;
       }
    }
 }

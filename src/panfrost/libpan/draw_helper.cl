@@ -368,6 +368,8 @@ panlib_patch_attrib(struct panlib_draw_info *draw,
    pan_pack(desc, ATTRIBUTE, cfg) {
       cfg.buffer_index = unpacked_desc.buffer_index;
       cfg.offset = info.base_offset + draw->instance.base * info.stride;
+      if (draw->instance.count > 1)
+         cfg.offset -= draw->vertex.raw_offset * info.offset_start_stride;
       cfg.offset_enable = true;
       cfg.format = unpacked_desc.format;
    }

@@ -37,5 +37,12 @@ struct libpan_draw_helper_attrib_info {
 
     /* When the attribute is per instance, the stride otherwise 0 */
     uint32_t stride;
+
+    /* The hardware adds the draw's offset_start to the index of every
+     * attribute, also after the instance divisor. When the attribute is per
+     * instance with a non-zero divisor, the stride to cancel it with on
+     * instanced draws, otherwise 0.
+     */
+    uint32_t offset_start_stride;
 };
 #endif
