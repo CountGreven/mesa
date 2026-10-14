@@ -365,7 +365,9 @@ lower_store_output(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_st
 static void
 store_index(nir_builder *b, struct lower_gs_state *st, nir_def *idx_slot, nir_def *v)
 {
-   nir_def *layer = nir_load_var(b, st->cur_layer);
+   /* A framebuffer without layers ignores gl_Layer. */
+   nir_def *layer = nir_bcsel(b, nir_ieq_imm(b, st->layer_count, 1), nir_imm_int(b, 0),
+                              nir_load_var(b, st->cur_layer));
    nir_push_if(b, nir_ult(b, layer, st->layer_count));
    {
       nir_def *slot = nir_iadd(b, nir_imul(b, layer, st->layer_stride), idx_slot);
