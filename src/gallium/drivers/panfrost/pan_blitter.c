@@ -432,8 +432,8 @@ panfrost_blitter_resource_copy_region(struct pipe_context *pipe,
           (dst_x % 4 == 0) && (src_box->x % 4 == 0)) {
          struct panfrost_resource *pdst = pan_resource(dst);
 
-         scr->vtbl.compute_copy_buffer(pipe, pdst, dst_x, pan_resource(src),
-                                       src_box->x, size);
+         scr->vtbl.batch_copy_buffer(pipe, pdst, dst_x, pan_resource(src),
+                                     src_box->x, size);
 
          /* The GPU wrote [dst_x, dst_x + size) of the destination buffer, so
           * mark that range valid for later reads.
