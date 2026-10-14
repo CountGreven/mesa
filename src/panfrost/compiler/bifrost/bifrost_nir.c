@@ -1068,6 +1068,12 @@ bifrost_postprocess_nir(nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_phis_to_scalar, bi_vectorize_filter, &gpu_id);
 
    bi_optimize_loop(nir, gpu_id, false /* allow_copies */);
+
+   /* Issue ATEST as soon as the coverage is final, so a late depth/stencil
+    * update isn't held back by the rest of the shader. Only measured on v6.
+    */
+   if (gpu_arch < 9)
+      NIR_PASS(_, nir, pan_nir_hoist_atest);
 }
 
 static bool
