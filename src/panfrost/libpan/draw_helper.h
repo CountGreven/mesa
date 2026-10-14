@@ -26,6 +26,30 @@ struct libpan_draw_helper_index_min_max_result {
     uint32_t max;
 };
 
+/* One draw of a multi-draw indexed indirect (panlib_draw_indexed_indirect_multi_helper):
+ * the arguments of panlib_draw_indexed_indirect_helper, addresses as integers. */
+struct libpan_draw_helper_indexed_draw {
+    uint64_t cmd;
+    uint64_t index_buffer_ptr;
+    uint64_t index_min_max_res;
+    uint64_t heap;
+    uint64_t varying_bufs_descs;
+    uint64_t attrib_bufs_descs;
+    uint64_t attrib_bufs_infos;
+    uint64_t attribs_descs;
+    uint64_t attribs_infos;
+    uint64_t first_vertex_sysval;
+    uint64_t first_instance_sysval;
+    uint64_t raw_vertex_offset_sysval;
+    uint64_t idvs_job;
+    uint64_t vertex_job;
+    uint64_t tiler_job;
+    uint32_t index_size;
+    uint32_t primitive_vertex_count;
+    uint32_t attrib_bufs_valid;
+    uint32_t attribs_valid;
+};
+
 struct libpan_draw_helper_attrib_buf_info {
     uint32_t divisor;
     uint32_t stride;
