@@ -368,6 +368,9 @@ enum {
 #define PAN_SYSVAL_ID_TO_TXS_TEX_IDX(id)  ((id)&0x7f)
 #define PAN_SYSVAL_ID_TO_TXS_DIM(id)      (((id) >> 7) & 0x3)
 #define PAN_SYSVAL_ID_TO_TXS_IS_ARRAY(id) !!((id) & (1 << 9))
+/* An image size query on a cube (array) image: the layers count whole cubes. */
+#define PAN_TXS_SYSVAL_CUBE               (1 << 10)
+#define PAN_SYSVAL_ID_TO_TXS_IS_CUBE(id)  !!((id) & PAN_TXS_SYSVAL_CUBE)
 
 /* Sysvals are always mapped to UBO1 */
 #define PAN_UBO_SYSVALS 1

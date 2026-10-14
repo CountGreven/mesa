@@ -1179,8 +1179,12 @@ panfrost_upload_image_size_sysval(struct panfrost_batch *batch,
    if (dim > 2)
       uniform->i[2] = u_minify(image->resource->depth0, image->u.tex.level);
 
-   if (is_array)
+   /* A cube array's layers are faces; imageCubeArray counts cubes. */
+   if (is_array) {
       uniform->i[dim] = image->resource->array_size;
+      if (PAN_SYSVAL_ID_TO_TXS_IS_CUBE(sysvalid))
+         uniform->i[dim] /= 6;
+   }
 }
 
 static void

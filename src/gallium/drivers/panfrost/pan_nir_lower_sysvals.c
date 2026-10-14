@@ -125,7 +125,10 @@ sysval_for_intrinsic(unsigned arch, nir_intrinsic_instr *intr, unsigned *offset)
       bool is_array = nir_intrinsic_image_array(intr);
       unsigned dim = nir_intrinsic_dest_components(intr) - is_array;
 
-      return PAN_SYSVAL(IMAGE_SIZE, PAN_TXS_SYSVAL_ID(uindex, dim, is_array));
+      const bool is_cube = nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_CUBE;
+
+      return PAN_SYSVAL(IMAGE_SIZE, PAN_TXS_SYSVAL_ID(uindex, dim, is_array) |
+                                       (is_cube ? PAN_TXS_SYSVAL_CUBE : 0));
    }
 
    default:
