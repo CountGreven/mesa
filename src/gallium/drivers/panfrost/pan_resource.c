@@ -2343,7 +2343,7 @@ panfrost_ptr_unmap(struct pipe_context *pctx, struct pipe_transfer *transfer)
    struct panfrost_device *dev = pan_device(pctx->screen);
 
    if (trans->buffer_staging) {
-      pan_screen(pctx->screen)->vtbl.compute_copy_buffer(
+      pan_screen(pctx->screen)->vtbl.batch_copy_buffer(
          pctx, prsrc, transfer->box.x, pan_resource(trans->staging.rsrc), 0,
          transfer->box.width);
       pipe_resource_reference(&trans->staging.rsrc, NULL);

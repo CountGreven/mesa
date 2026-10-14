@@ -118,6 +118,16 @@ struct panfrost_vtable {
                                struct panfrost_resource *src,
                                unsigned src_offset, unsigned size);
 
+   /* Same contract, but ordered inside the current batch when one is open
+    * instead of flushing around a separate compute batch. Used for staged
+    * buffer writes and buffer->buffer copies.
+    */
+   void (*batch_copy_buffer)(struct pipe_context *pctx,
+                             struct panfrost_resource *dst,
+                             unsigned dst_offset,
+                             struct panfrost_resource *src,
+                             unsigned src_offset, unsigned size);
+
    /* construct a render target blend descriptor */
    uint64_t (*get_conv_desc)(enum pipe_format fmt, unsigned rt,
                              unsigned force_size, bool dithered);
