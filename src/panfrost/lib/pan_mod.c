@@ -249,6 +249,16 @@ pan_mod_afbc_test_props(const struct pan_kmod_dev_props *dprops,
        pan_afbc_superblock_width(iprops->modifier) != 16)
       return PAN_MOD_NOT_OPTIMAL;
 
+#if PAN_ARCH <= 6
+   /* v6 has no reverse issue order bit, so two 16x16 tiles writing halves of
+    * one wide superblock race and the fragment job faults with
+    * DATA_INVALID_FAULT. Don't render to wide superblocks.
+    */
+   if (iusage && (iusage->bind & PAN_BIND_RENDER_TARGET) &&
+       pan_afbc_superblock_width(iprops->modifier) != 16)
+      return PAN_MOD_NOT_OPTIMAL;
+#endif
+
    /* Prefer YTR when available. */
    if (pan_afbc_can_ytr(iprops->format) &&
        !(iprops->modifier & AFBC_FORMAT_MOD_YTR))
