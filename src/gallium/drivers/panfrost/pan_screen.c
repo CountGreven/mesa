@@ -556,7 +556,7 @@ static bool
 panfrost_expose_gs(const struct panfrost_device *dev)
 {
    return (dev->arch == 6 || dev->arch == 7) &&
-          debug_get_bool_option("PAN_EXPOSE_GS", false);
+          debug_get_bool_option("PAN_EXPOSE_GS", true);
 }
 
 static void
@@ -576,9 +576,7 @@ panfrost_init_shader_caps(struct panfrost_screen *screen)
          break;
       case MESA_SHADER_GEOMETRY:
          /* Emulated as compute jobs on the Bifrost job manager (pan_gs.h).
-          * Opt-in until the emulation passes conformance: exposed, it
-          * still fails ~10% of the GLES 3.1 geometry-stage cases that
-          * are otherwise NotSupported. */
+          * PAN_EXPOSE_GS=0 hides it again. */
          if (panfrost_expose_gs(dev))
             break;
          continue;
