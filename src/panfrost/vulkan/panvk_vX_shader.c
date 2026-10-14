@@ -592,6 +592,19 @@ is_robust_ssbo_intr(const nir_intrinsic_instr *intr, UNUSED const void *data)
 }
 
 static bool
+is_robust_image_atomic_intr(const nir_intrinsic_instr *intr,
+                            UNUSED const void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
 valhall_lower_get_ssbo_size(struct nir_builder *b,
                             nir_intrinsic_instr *intr, void *data)
 {
@@ -856,6 +869,17 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
     */
    if (PAN_ARCH < 9)
       NIR_PASS(_, nir, pan_nir_lower_image_ms);
+
+   /* Image atomics become LEA_ATTR_TEX + a global atomic on Bifrost. The
+    * address LEA_ATTR_TEX returns for an out-of-bounds texel is not safe to
+    * access (only ST_CVT drops it, through the conversion descriptor), so
+    * OOB atomics write stray memory and fault the job. Bounds-check them in
+    * the shader. Same ordering constraint as above for image_deref_size.
+    */
+   if (PAN_ARCH < 9 &&
+       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT)
+      NIR_PASS(_, nir, nir_lower_robust_access, is_robust_image_atomic_intr,
+               NULL);
 
    panvk_per_arch(nir_lower_descriptors)(nir, dev, rs, set_layout_count,
                                          set_layouts, state, desc_info);
