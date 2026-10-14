@@ -867,7 +867,10 @@ bifrost_postprocess_nir(nir_shader *nir,
       NIR_PASS(_, nir, pan_nir_lower_fs_outputs, skip_atest,
                inputs->fragcolor_nr_cbufs);
    } else if (nir->info.stage == MESA_SHADER_VERTEX) {
-      NIR_PASS(_, nir, nir_lower_viewport_transform);
+      /* A vertex shader feeding the geometry shader emulation hands it clip
+       * space: the emulation does the viewport transform on its outputs. */
+      if (!inputs->vs_keep_clip_space)
+         NIR_PASS(_, nir, nir_lower_viewport_transform);
       NIR_PASS(_, nir, nir_lower_point_size, 1.0, 0.0);
 
       /* Copy varying format & Layout */
