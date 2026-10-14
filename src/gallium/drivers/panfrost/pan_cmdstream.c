@@ -242,8 +242,13 @@ panfrost_create_sampler_state(struct pipe_context *pctx,
       /*
        * Disabling round_to_nearest_even for NEAREST filters ensures proper
        * floor() behavior as required by OpenCL_C spec section 8.2.
+       *
+       * Either filter counts: with round_to_nearest_even, a coordinate within
+       * 2^-9 of a texel's edge rounds into the next texel, and on a cube map
+       * the next texel can be on the neighbouring face (minified to a 1x1
+       * level, KHR-GLES31.core.texture_cube_map_array.sampling).
        */
-      if (cso->mag_img_filter == PIPE_TEX_FILTER_NEAREST &&
+      if (cso->mag_img_filter == PIPE_TEX_FILTER_NEAREST ||
           cso->min_img_filter == PIPE_TEX_FILTER_NEAREST)
          cfg.round_to_nearest_even = false;
 
