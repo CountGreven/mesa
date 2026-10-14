@@ -484,6 +484,10 @@ pan_nir_lower_mediump_io(nir_shader *nir)
 
    switch (nir->info.stage) {
    case MESA_SHADER_VERTEX:
+      /* The geometry shader's inputs stay 32-bit: linking a 16-bit output
+       * to them would propagate a constant's f16 bits as an f32. */
+      if (nir->info.next_stage == MESA_SHADER_GEOMETRY)
+         return;
       modes = nir_var_shader_out;
       break;
    case MESA_SHADER_FRAGMENT:
