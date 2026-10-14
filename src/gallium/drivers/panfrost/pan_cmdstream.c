@@ -4182,6 +4182,99 @@ panfrost_multi_draw_direct(struct pipe_context *pipe,
    }
 }
 
+/* Without a geometry shader an adjacency primitive draws as its base primitive, the adjacent
+ * vertices ignored: rewrite the vertices that remain into a 32-bit index list. */
+static void
+panfrost_draw_adjacency_as_base(struct pipe_context *pipe, const struct pipe_draw_info *info,
+                                unsigned drawid, const struct pipe_draw_start_count_bias *draw)
+{
+   unsigned out_count = 0;
+   enum mesa_prim mode;
+
+   switch (info->mode) {
+   case MESA_PRIM_LINES_ADJACENCY:
+      mode = MESA_PRIM_LINES;
+      out_count = draw->count / 4 * 2;
+      break;
+   case MESA_PRIM_LINE_STRIP_ADJACENCY:
+      mode = MESA_PRIM_LINE_STRIP;
+      out_count = draw->count >= 4 ? draw->count - 2 : 0;
+      break;
+   case MESA_PRIM_TRIANGLES_ADJACENCY:
+      mode = MESA_PRIM_TRIANGLES;
+      out_count = draw->count / 6 * 3;
+      break;
+   default:
+      mode = MESA_PRIM_TRIANGLE_STRIP;
+      out_count = draw->count >= 6 ? (draw->count - 4) / 2 + 2 : 0;
+      break;
+   }
+   if (!out_count)
+      return;
+
+   uint32_t *idx = malloc(out_count * sizeof(uint32_t));
+   if (!idx)
+      return;
+
+   const void *src = NULL;
+   struct pipe_transfer *transfer = NULL;
+   if (info->index_size) {
+      if (info->has_user_indices) {
+         src = (const uint8_t *)info->index.user + draw->start * info->index_size;
+      } else {
+         src = pipe_buffer_map_range(pipe, info->index.resource, draw->start * info->index_size,
+                                     draw->count * info->index_size, PIPE_MAP_READ, &transfer);
+         if (!src) {
+            free(idx);
+            return;
+         }
+      }
+   }
+
+   for (unsigned o = 0; o < out_count; o++) {
+      /* The kept vertex: 1, 2 of each 4; 1 .. n - 2; 0, 2, 4 of each 6; the even vertices. */
+      unsigned v = mode == MESA_PRIM_LINES       ? o / 2 * 4 + 1 + o % 2
+                   : mode == MESA_PRIM_LINE_STRIP ? o + 1
+                   : mode == MESA_PRIM_TRIANGLES  ? o / 3 * 6 + o % 3 * 2
+                                                  : o * 2;
+      switch (info->index_size) {
+      case 1: idx[o] = ((const uint8_t *)src)[v]; break;
+      case 2: idx[o] = ((const uint16_t *)src)[v]; break;
+      case 4: idx[o] = ((const uint32_t *)src)[v]; break;
+      default: idx[o] = draw->start + v; break;
+      }
+   }
+
+   if (transfer)
+      pipe_buffer_unmap(pipe, transfer);
+
+   struct pipe_draw_info base = *info;
+   base.mode = mode;
+   base.index_size = 4;
+   base.has_user_indices = true;
+   base.index.user = idx;
+   base.index_bounds_valid = false;
+   base.primitive_restart = info->primitive_restart && info->index_size;
+   base.restart_index = info->index_size == 4 ? info->restart_index
+                        : info->index_size == 2 ? 0xffff : 0xff;
+   if (base.primitive_restart && info->index_size < 4) {
+      /* Widened, the restart index changes with the indices. */
+      for (unsigned o = 0; o < out_count; o++) {
+         if (idx[o] == info->restart_index)
+            idx[o] = UINT32_MAX;
+      }
+      base.restart_index = UINT32_MAX;
+   }
+
+   const struct pipe_draw_start_count_bias d = {
+      .start = 0,
+      .count = out_count,
+      .index_bias = info->index_size ? draw->index_bias : 0,
+   };
+   pipe->draw_vbo(pipe, &base, drawid, NULL, &d, 1);
+   free(idx);
+}
+
 static void
 panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
                   unsigned drawid_offset,
@@ -4199,11 +4292,22 @@ panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
    ctx->draw_calls++;
 
    /* Adjacency is only meaningful to a geometry shader, and only the
-    * emulation (pan_gs.h) can assemble it. */
+    * emulation (pan_gs.h) can assemble it; without one the base primitive
+    * is drawn. */
    if (info->mode >= MESA_PRIM_LINES_ADJACENCY &&
        info->mode <= MESA_PRIM_TRIANGLE_STRIP_ADJACENCY &&
-       !ctx->uncompiled[MESA_SHADER_GEOMETRY])
+       !ctx->uncompiled[MESA_SHADER_GEOMETRY]) {
+      if (indirect && indirect->buffer) {
+         util_draw_indirect(pipe, info, drawid_offset, indirect);
+         return;
+      }
+      for (unsigned i = 0; i < num_draws; i++) {
+         panfrost_draw_adjacency_as_base(pipe, info,
+                                         drawid_offset + (info->increment_draw_id ? i : 0),
+                                         &draws[i]);
+      }
       return;
+   }
 
    /* The emulation assembles primitives itself and does not see restarts:
     * split the draw at them on the CPU, for lists too (the restart index is
