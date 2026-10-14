@@ -352,6 +352,7 @@ bool pan_nir_lower_framebuffer(nir_shader *shader,
                                unsigned blend_shader_nr_samples,
                                bool broken_ld_special);
 
+bool pan_nir_hoist_atest(nir_shader *nir);
 bool pan_nir_lower_fs_outputs(nir_shader *shader, bool skip_atest,
                               unsigned fragcolor_nr_cbufs);
 

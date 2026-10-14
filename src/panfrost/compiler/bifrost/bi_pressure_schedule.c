@@ -42,6 +42,7 @@ create_dag(bi_context *ctx, bi_block *block, void *memctx)
 
    /* Last memory load, to serialize stores against */
    struct sched_node *memory_load = NULL;
+   struct sched_node *atest = NULL;
 
    /* Last memory store, to serialize loads and stores against */
    struct sched_node *memory_store = NULL;
@@ -65,6 +66,15 @@ create_dag(bi_context *ctx, bi_block *block, void *memctx)
          last_write[I->dest[d].value] = node;
 
       add_dep(node, preload);
+
+      /* Keep ATEST where it was emitted: it makes the coverage final, and
+       * the depth/stencil unit waits for it when the update is late, so
+       * sinking it to the end of the shader to save registers delays every
+       * fragment behind it.
+       */
+      add_dep(node, atest);
+      if (I->op == BI_OPCODE_ATEST)
+         atest = node;
 
       switch (bi_get_opcode_props(I)->message) {
       case BIFROST_MESSAGE_LOAD:
