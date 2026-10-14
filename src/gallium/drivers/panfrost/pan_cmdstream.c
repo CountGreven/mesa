@@ -31,6 +31,7 @@
 #include "pan_bo.h"
 #include "pan_buffer.h"
 #include "pan_cmdstream.h"
+#include "nir_xfb_info.h"
 #include "pan_context.h"
 #include "pan_csf.h"
 #include "pan_fb_preload.h"
@@ -3575,13 +3576,31 @@ panfrost_gs_emit_out_varyings(struct panfrost_batch *batch, const struct pan_gs_
    /* Not the varying pool: the vertex shader reaches that through the varying unit, and plain
     * compute stores into it do not land (panvk measured it). */
    struct pan_ptr pos = pan_pool_alloc_aligned(&batch->pool.base, out->out_verts * 16, 64);
-   struct pan_ptr gen =
-      pan_pool_alloc_aligned(&batch->pool.base, out->out_verts * gsi->out_stride, 64);
+   struct pan_ptr gen, idx;
+   const uint64_t gen_size = (uint64_t)out->out_verts * gsi->out_stride;
+   const uint64_t idx_size = (uint64_t)out->index_count * 4 * out->layer_count;
+
+   /* Transform feedback is captured on the CPU after the draw: the records and indices have to
+    * outlive the batch's pools (panfrost_gs_capture_xfb). */
+   const nir_shader *gs_nir = ctx->uncompiled[MESA_SHADER_GEOMETRY]->nir;
+   if (gs_nir->xfb_info && ctx->streamout.num_targets) {
+      out->xfb_idx_offset = ALIGN_POT(gen_size, 64);
+      out->xfb_bo = panfrost_bo_create(dev, out->xfb_idx_offset + idx_size, 0,
+                                       "Geometry shader transform feedback");
+      if (!out->xfb_bo || panfrost_bo_mmap(out->xfb_bo))
+         return false;
+      panfrost_batch_add_bo(batch, out->xfb_bo);
+      gen = (struct pan_ptr){.cpu = out->xfb_bo->ptr.cpu, .gpu = out->xfb_bo->ptr.gpu};
+      idx = (struct pan_ptr){.cpu = out->xfb_bo->ptr.cpu + out->xfb_idx_offset,
+                             .gpu = out->xfb_bo->ptr.gpu + out->xfb_idx_offset};
+   } else {
+      gen = pan_pool_alloc_aligned(&batch->pool.base, gen_size, 64);
+      idx = pan_pool_alloc_aligned(&batch->pool.base, idx_size, 64);
+   }
+
    struct pan_ptr psiz = {0};
    if (gsi->writes_psiz)
       psiz = pan_pool_alloc_aligned(&batch->pool.base, ALIGN_POT(out->out_verts * 2, 4), 64);
-   struct pan_ptr idx = pan_pool_alloc_aligned(
-      &batch->pool.base, (uint64_t)out->index_count * 4 * out->layer_count, 64);
    if (!bufs.cpu || !pos.cpu || !gen.cpu || !idx.cpu || (gsi->writes_psiz && !psiz.cpu))
       return false;
 
@@ -3607,6 +3626,7 @@ panfrost_gs_emit_out_varyings(struct panfrost_batch *batch, const struct pan_gs_
 
    /* The dead vertex, far outside any viewport. */
    const unsigned dead = out->out_verts - 1;
+   out->dead_vertex = dead;
    float *dead_pos = (float *)pos.cpu + dead * 4;
    dead_pos[0] = dead_pos[1] = -1.0e6f;
    dead_pos[2] = 0.0f;
@@ -3666,6 +3686,97 @@ panfrost_gs_emit_out_varyings(struct panfrost_batch *batch, const struct pan_gs_
 
 /* Everything the three jobs need, and the draw's pan_gs_params for the GS_PARAMS sysval. Returns
  * false when the draw has no complete input primitive, or an allocation failed. */
+/* Transform feedback of the geometry shader's outputs, after the draw ran: walk the emulation's
+ * index buffer in slot order (invocation, then emission order; unused slots hold the dead vertex)
+ * and write every whole primitive that still fits into the bound buffers. */
+static void
+panfrost_gs_capture_xfb(struct panfrost_context *ctx, const struct pan_gs_info *gsi,
+                        const nir_xfb_info *xfb, const struct panfrost_gs_draw *d)
+{
+   const uint8_t *gen = d->xfb_bo->ptr.cpu;
+   const uint32_t *idx = (const uint32_t *)(gen + d->xfb_idx_offset);
+   const unsigned vpp = gsi->output_verts;
+
+   uint8_t *dst[PIPE_MAX_SO_BUFFERS] = {0};
+   unsigned stride[PIPE_MAX_SO_BUFFERS] = {0}, cap[PIPE_MAX_SO_BUFFERS] = {0};
+   unsigned off[PIPE_MAX_SO_BUFFERS] = {0};
+
+   for (unsigned b = 0; b < ctx->streamout.num_targets && b < PIPE_MAX_SO_BUFFERS; b++) {
+      struct pipe_stream_output_target *t = ctx->streamout.targets[b];
+      if (!t || !(xfb->buffers_written & BITFIELD_BIT(b)) || !xfb->buffers[b].stride)
+         continue;
+
+      /* Earlier GPU work on the buffer is flushed with every batch, not finished. */
+      struct panfrost_resource *rsrc = pan_resource(t->buffer);
+      if (panfrost_bo_mmap(rsrc->bo) || !panfrost_bo_wait(rsrc->bo, INT64_MAX, true))
+         continue;
+
+      dst[b] = (uint8_t *)rsrc->bo->ptr.cpu + t->buffer_offset;
+      stride[b] = xfb->buffers[b].stride;
+      cap[b] = t->buffer_size / stride[b];
+      off[b] = pan_so_target(t)->offset;
+      util_range_add(&rsrc->base, &rsrc->valid_buffer_range, t->buffer_offset,
+                     t->buffer_offset + t->buffer_size);
+   }
+
+   unsigned written = 0;
+   for (unsigned s = 0; s + vpp <= d->layer_stride; s += vpp) {
+      /* A primitive is in the region of its layer, the others keep the dead vertex. */
+      const uint32_t *p = NULL;
+      for (unsigned l = 0; l < d->layer_count && !p; l++) {
+         const uint32_t *q = idx + (uint64_t)l * d->layer_stride + s;
+         if (q[0] != d->dead_vertex)
+            p = q;
+      }
+      if (!p)
+         continue;
+
+      bool fits = true;
+      for (unsigned b = 0; b < PIPE_MAX_SO_BUFFERS; b++) {
+         if (dst[b] && off[b] + vpp > cap[b])
+            fits = false;
+      }
+      if (!fits)
+         break;
+
+      for (unsigned k = 0; k < vpp; k++) {
+         const uint8_t *rec = gen + (uint64_t)p[k] * gsi->out_stride;
+
+         for (unsigned i = 0; i < xfb->output_count; i++) {
+            const nir_xfb_output_info *o = &xfb->outputs[i];
+            if (!dst[o->buffer])
+               continue;
+
+            const unsigned loc =
+               o->location == VARYING_SLOT_POS ? PAN_GS_XFB_POS_SLOT : o->location;
+            const uint32_t src_off = pan_gs_out_offset(gsi, loc);
+            uint8_t *w = dst[o->buffer] + (uint64_t)(off[o->buffer] + k) * stride[o->buffer] +
+                         o->offset;
+
+            unsigned n = 0;
+            u_foreach_bit(c, o->component_mask) {
+               uint32_t v = 0;
+               if (src_off != PAN_GS_SLOT_UNUSED)
+                  memcpy(&v, rec + src_off + 4 * c, 4);
+               memcpy(w + 4 * n++, &v, 4);
+            }
+         }
+      }
+
+      for (unsigned b = 0; b < PIPE_MAX_SO_BUFFERS; b++) {
+         if (dst[b])
+            off[b] += vpp;
+      }
+      written++;
+   }
+
+   for (unsigned b = 0; b < ctx->streamout.num_targets && b < PIPE_MAX_SO_BUFFERS; b++) {
+      if (dst[b])
+         pan_so_target(ctx->streamout.targets[b])->offset = off[b];
+   }
+   ctx->tf_prims_generated += written;
+}
+
 static bool
 panfrost_gs_prepare(struct panfrost_batch *batch, const struct pipe_draw_info *info,
                     const struct pipe_draw_start_count_bias *draw, struct panfrost_gs_draw *out)
@@ -3770,7 +3881,7 @@ panfrost_single_draw_direct(struct panfrost_batch *batch,
 
 #if PAN_ARCH == 6 || PAN_ARCH == 7
    struct panfrost_uncompiled_shader *gs = ctx->uncompiled[MESA_SHADER_GEOMETRY];
-   struct panfrost_gs_draw gs_draw;
+   struct panfrost_gs_draw gs_draw = {0};
    struct pipe_grid_info gs_grid = {.block = {PAN_GS_WORKGROUP_SIZE, 1, 1}, .work_dim = 1};
 
    /* The tiler draws what the geometry shader emits. */
@@ -3805,10 +3916,17 @@ panfrost_single_draw_direct(struct panfrost_batch *batch,
    if (gs) {
       /* The vertex shader's descriptor the generic check also wants is
        * emitted below. */
-      if (ctx->rasterizer->base.rasterizer_discard ||
-          batch->scissor_culls_everything ||
-          !panfrost_gs_prepare(batch, info, draw, &gs_draw))
+      /* With transform feedback the geometry shader runs even when nothing
+       * is rasterized. */
+      const bool gs_xfb = gs->nir->xfb_info && ctx->streamout.num_targets;
+      const bool no_raster = ctx->rasterizer->base.rasterizer_discard ||
+                             batch->scissor_culls_everything;
+      if ((no_raster && !gs_xfb) || !panfrost_gs_prepare(batch, info, draw, &gs_draw)) {
+         if (gs_draw.xfb_bo)
+            panfrost_bo_unreference(gs_draw.xfb_bo);
          return;
+      }
+      gs_draw.skip_tiler = no_raster;
 
       /* The emulation's compute sysvals, and its parameters every draw. */
       gs_grid.grid[0] = gs_draw.wg;
@@ -3831,8 +3949,10 @@ panfrost_single_draw_direct(struct panfrost_batch *batch,
 
 #if PAN_ARCH == 6 || PAN_ARCH == 7
    if (gs) {
+      bool gs_launched = false;
       if (vertex_count > 0 && batch->rsd[MESA_SHADER_VERTEX]) {
          GENX(jm_launch_draw_gs)(batch, info, vertex_count, &gs_draw);
+         gs_launched = true;
 
          /* The armed compute job is queued: the interval now owns a GPU sum,
           * so get_query_result() reads the counter BO instead of the stale CPU
@@ -3841,6 +3961,16 @@ panfrost_single_draw_direct(struct panfrost_batch *batch,
             ctx->primitives_generated_query->prims_gpu_scored = true;
       }
       batch->draw_count++;
+
+      if (gs_draw.xfb_bo) {
+         if (gs_launched) {
+            panfrost_flush_all_batches(ctx, "geometry shader transform feedback");
+            panfrost_bo_wait(gs_draw.xfb_bo, INT64_MAX, true);
+            panfrost_gs_capture_xfb(ctx, &gs->gs, gs->nir->xfb_info, &gs_draw);
+            ctx->gs_xfb_flushed = true;
+         }
+         panfrost_bo_unreference(gs_draw.xfb_bo);
+      }
       return;
    }
 #endif
@@ -4035,6 +4165,13 @@ panfrost_multi_draw_direct(struct pipe_context *pipe,
    unsigned drawid = drawid_offset;
 
    for (unsigned i = 0; i < num_draws; i++) {
+      if (ctx->gs_xfb_flushed) {
+         ctx->gs_xfb_flushed = false;
+         batch = prepare_draw(pipe, info->mode);
+         if (!batch)
+            return;
+      }
+
       panfrost_single_draw_direct(batch, &tmp_info, drawid, &draws[i]);
 
       if (tmp_info.increment_draw_id) {

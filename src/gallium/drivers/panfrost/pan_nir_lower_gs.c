@@ -19,6 +19,7 @@
  */
 
 #include "pan_gs.h"
+#include "nir_xfb_info.h"
 
 #include "nir.h"
 #include "nir_builder.h"
@@ -54,6 +55,12 @@ pan_gs_gather_info(const nir_shader *nir, struct pan_gs_info *info)
       info->generic_mask |= BITFIELD64_BIT(PAN_GS_VIEWPORT_SLOT);
    if (written & VARYING_BIT_LAYER)
       info->generic_mask |= BITFIELD64_BIT(PAN_GS_LAYER_SLOT);
+   if (nir->xfb_info) {
+      for (unsigned i = 0; i < nir->xfb_info->output_count; i++) {
+         if (nir->xfb_info->outputs[i].location == VARYING_SLOT_POS)
+            info->generic_mask |= BITFIELD64_BIT(PAN_GS_XFB_POS_SLOT);
+      }
+   }
    info->out_stride = 16 * MAX2(util_bitcount64(info->generic_mask), 1);
 
    info->clip_count = nir->info.clip_distance_array_size;
@@ -407,7 +414,8 @@ lower_emit_vertex(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_sta
       u_foreach_bit64(loc, info->generic_mask) {
          nir_variable *var = loc == PAN_GS_VIEWPORT_SLOT ? st->outputs[VARYING_SLOT_VIEWPORT]
                              : loc == PAN_GS_LAYER_SLOT  ? st->outputs[VARYING_SLOT_LAYER]
-                                                         : st->outputs[loc];
+                             : loc == PAN_GS_XFB_POS_SLOT ? st->outputs[VARYING_SLOT_POS]
+                                                          : st->outputs[loc];
          if (!var)
             continue;
 

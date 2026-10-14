@@ -262,6 +262,9 @@ struct panfrost_context {
     * pieces continue gl_PrimitiveIDIn from gs_prim_id_base. */
    bool gs_continue_prim_id;
    unsigned gs_prim_id_base;
+   /* A geometry shader transform feedback capture flushed every batch: a
+    * draw loop must fetch the current batch again. */
+   bool gs_xfb_flushed;
    bool cond_cond;
    enum pipe_render_cond_flag cond_mode;
 
@@ -459,6 +462,14 @@ struct panfrost_gs_draw {
    uint32_t out_verts, index_count;
    /* Index regions, one per layer of the framebuffer (pan_gs_params). */
    uint32_t layer_count, layer_stride;
+   /* Transform feedback of the geometry shader's outputs: its generic
+    * records and index buffer live in xfb_bo (gen at 0, indices at
+    * xfb_idx_offset) so the CPU can capture them after the draw. */
+   struct panfrost_bo *xfb_bo;
+   uint32_t xfb_idx_offset;
+   uint32_t dead_vertex;
+   /* Rasterizer discard with capture: run the geometry shader, no tiler. */
+   bool skip_tiler;
    /* Compute workgroups of PAN_GS_WORKGROUP_SIZE. */
    uint32_t wg;
    enum mesa_prim out_prim;

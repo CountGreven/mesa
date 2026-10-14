@@ -108,6 +108,9 @@ struct pan_gs_params {
  * generic. The fragment shader's reads are moved to them (panfrost_shader_compile). */
 #define PAN_GS_VIEWPORT_SLOT VARYING_SLOT_CULL_DIST0
 #define PAN_GS_LAYER_SLOT    VARYING_SLOT_CULL_DIST1
+/* The clip-space position, kept for transform feedback (the tiler's buffer has it in screen
+ * space, snapped). A slot no GLSL ES shader writes. */
+#define PAN_GS_XFB_POS_SLOT  VARYING_SLOT_CLIP_VERTEX
 
 /* What the draw path needs to know about a geometry shader, gathered when it is created. */
 struct pan_gs_info {

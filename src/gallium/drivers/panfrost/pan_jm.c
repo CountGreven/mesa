@@ -1250,6 +1250,9 @@ GENX(jm_launch_draw_gs)(struct panfrost_batch *batch,
                                false, 0, 0, &vertex, false);
    unsigned c = pan_jc_add_job(&batch->jm.jobs.vtc_jc, MALI_JOB_TYPE_COMPUTE, true,
                                true, v, 0, &compute, false);
+   if (gs->skip_tiler)
+      return;
+
    pan_jc_add_job(&batch->jm.jobs.vtc_jc, MALI_JOB_TYPE_TILER, false, false, c, 0,
                   &tiler, false);
 
