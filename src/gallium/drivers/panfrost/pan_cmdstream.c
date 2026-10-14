@@ -4369,6 +4369,46 @@ panfrost_compute_copy_buffer(struct pipe_context *pctx,
 
    panfrost_flush_all_batches(ctx, "Compute buffer copy post-barrier");
 }
+
+/* Copy between buffers inside the render batch being built (staged writes,
+ * buffer->buffer copies), instead of a separate compute batch with flushes
+ * around it.
+ * The copy is a JM barrier job, so it runs after every earlier job of the
+ * batch, and the next job is made a barrier too, so later jobs see the new
+ * contents. Without a render batch (or on CSF) fall back to the flushing copy.
+ */
+static void
+panfrost_batch_copy_buffer(struct pipe_context *pctx,
+                           struct panfrost_resource *dst, unsigned dst_offset,
+                           struct panfrost_resource *src, unsigned src_offset,
+                           unsigned size)
+{
+#if PAN_ARCH <= 9
+   struct panfrost_context *ctx = pan_context(pctx);
+   struct panfrost_batch *batch = ctx->batch[PANFROST_BATCH_RENDER];
+
+   if (batch) {
+      uint64_t src_addr = src->plane.base + src_offset;
+      uint64_t dst_addr = dst->plane.base + dst_offset;
+
+      assert((size % 4) == 0 && (src_addr % 4) == 0 && (dst_addr % 4) == 0);
+
+      uint32_t chunks = DIV_ROUND_UP(size, PANLIB_COPY_MEM_CHUNK_SIZE);
+      uint32_t wgs = DIV_ROUND_UP(chunks, PANLIB_COPY_MEM_WG_SIZE);
+
+      panfrost_batch_read_rsrc(batch, src);
+      panfrost_batch_write_rsrc(batch, dst);
+
+      panlib_copy_mem(batch, panlib_1d(wgs), PANLIB_BARRIER_JM_BARRIER,
+                      dst_addr, src_addr, size);
+      batch->compute_count++;
+      batch->jm.jobs.vtc_jc.barrier_next = true;
+      return;
+   }
+#endif
+
+   panfrost_compute_copy_buffer(pctx, dst, dst_offset, src, src_offset, size);
+}
 #endif
 
 static void
@@ -5272,6 +5312,7 @@ GENX(panfrost_cmdstream_screen_init)(struct panfrost_screen *screen)
    screen->vtbl.mtk_detile = panfrost_mtk_detile_compute;
 #if PAN_ARCH >= 6
    screen->vtbl.compute_copy_buffer = panfrost_compute_copy_buffer;
+   screen->vtbl.batch_copy_buffer = panfrost_batch_copy_buffer;
 #endif
    screen->vtbl.emit_write_timestamp = emit_write_timestamp;
    screen->vtbl.emit_trace_ts = emit_trace_ts;
