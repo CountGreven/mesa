@@ -618,7 +618,8 @@ pan_nir_lower_gs(nir_shader *nir, const struct pan_gs_info *info, uint32_t noper
    /* gl_PrimitiveIDIn restarts with every instance. */
    nir_def *ppi = nir_umax(&b, st.prims_per_instance, nir_imm_int(&b, 1));
    st.instance = nir_udiv(&b, prim_global, ppi);
-   st.prim_id = nir_isub(&b, prim_global, nir_imul(&b, st.instance, ppi));
+   st.prim_id = nir_iadd(&b, nir_isub(&b, prim_global, nir_imul(&b, st.instance, ppi)),
+                         PARAM32(&b, &st, prim_id_base));
 
    emit_degenerate_fill(&b, &st);
 

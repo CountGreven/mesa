@@ -257,6 +257,11 @@ struct panfrost_context {
 
    struct panfrost_query *cond_query;
    struct panfrost_query *primitives_generated_query;
+
+   /* While a restarted draw is split for the geometry shader emulation, the
+    * pieces continue gl_PrimitiveIDIn from gs_prim_id_base. */
+   bool gs_continue_prim_id;
+   unsigned gs_prim_id_base;
    bool cond_cond;
    enum pipe_render_cond_flag cond_mode;
 

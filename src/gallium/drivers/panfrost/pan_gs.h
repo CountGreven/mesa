@@ -91,6 +91,9 @@ struct pan_gs_params {
    /* A shader writing gl_ViewportIndex: PAN_GS_MAX_VIEWPORTS x {scale xyz, offset xyz}, the
     * transform each output vertex gets by its index. */
    uint64_t viewports;
+   /* Added to gl_PrimitiveIDIn: the primitives of the earlier pieces of a draw the driver split
+    * at its primitive restarts, which continue the count. */
+   uint32_t prim_id_base;
 };
 
 #define PAN_GS_MAX_VIEWPORTS 16

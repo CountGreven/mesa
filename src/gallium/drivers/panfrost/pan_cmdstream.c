@@ -3718,6 +3718,10 @@ panfrost_gs_prepare(struct panfrost_batch *batch, const struct pipe_draw_info *i
    params->index_bias = info->index_size ? ctx->offset_start - draw->index_bias : 0;
    params->vertex_count = draw->count;
    params->flatshade_first = ctx->rasterizer->base.flatshade_first;
+   if (ctx->gs_continue_prim_id) {
+      params->prim_id_base = ctx->gs_prim_id_base;
+      ctx->gs_prim_id_base += ppi;
+   }
 
    /* GPU-side counting for an active PRIMITIVES_GENERATED query (pan_context.c):
     * the compute job atomic-adds its output primitives at the counter address
@@ -4054,17 +4058,17 @@ panfrost_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *info,
       return;
 
    /* The emulation assembles primitives itself and does not see restarts:
-    * split the draw at them on the CPU. */
+    * split the draw at them on the CPU, for lists too (the restart index is
+    * no vertex, and it ends an incomplete primitive). */
    if (ctx->uncompiled[MESA_SHADER_GEOMETRY] && info->primitive_restart &&
-       info->index_size && !(indirect && indirect->buffer) &&
-       info->mode != MESA_PRIM_POINTS && info->mode != MESA_PRIM_LINES &&
-       info->mode != MESA_PRIM_TRIANGLES &&
-       info->mode != MESA_PRIM_LINES_ADJACENCY &&
-       info->mode != MESA_PRIM_TRIANGLES_ADJACENCY) {
+       info->index_size && !(indirect && indirect->buffer)) {
       for (unsigned i = 0; i < num_draws; i++) {
+         ctx->gs_continue_prim_id = true;
+         ctx->gs_prim_id_base = 0;
          util_draw_vbo_without_prim_restart(
             pipe, info, drawid_offset + (info->increment_draw_id ? i : 0), NULL,
             &draws[i]);
+         ctx->gs_continue_prim_id = false;
       }
       return;
    }
