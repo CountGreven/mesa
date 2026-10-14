@@ -552,6 +552,13 @@ panfrost_get_dmabuf_modifier_planes(struct pipe_screen *pscreen, uint64_t modifi
    return planes;
 }
 
+static bool
+panfrost_expose_gs(const struct panfrost_device *dev)
+{
+   return (dev->arch == 6 || dev->arch == 7) &&
+          debug_get_bool_option("PAN_EXPOSE_GS", false);
+}
+
 static void
 panfrost_init_shader_caps(struct panfrost_screen *screen)
 {
@@ -568,8 +575,11 @@ panfrost_init_shader_caps(struct panfrost_screen *screen)
       case MESA_SHADER_COMPUTE:
          break;
       case MESA_SHADER_GEOMETRY:
-         /* Emulated as compute jobs on the Bifrost job manager (pan_gs.h). */
-         if (dev->arch == 6 || dev->arch == 7)
+         /* Emulated as compute jobs on the Bifrost job manager (pan_gs.h).
+          * Opt-in until the emulation passes conformance: exposed, it
+          * still fails ~10% of the GLES 3.1 geometry-stage cases that
+          * are otherwise NotSupported. */
+         if (panfrost_expose_gs(dev))
             break;
          continue;
       default:
@@ -913,7 +923,7 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
 
    /* Adjacency only reaches the geometry shader emulation, which assembles
     * the input primitives itself. */
-   if (dev->arch == 6 || dev->arch == 7) {
+   if (panfrost_expose_gs(dev)) {
       modes |= BITFIELD_BIT(MESA_PRIM_LINES_ADJACENCY) |
                BITFIELD_BIT(MESA_PRIM_LINE_STRIP_ADJACENCY) |
                BITFIELD_BIT(MESA_PRIM_TRIANGLES_ADJACENCY) |
