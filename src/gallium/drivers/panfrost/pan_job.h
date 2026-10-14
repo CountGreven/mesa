@@ -120,6 +120,11 @@ struct panfrost_batch {
    /* Tiler context */
    struct pan_tiler_context tiler_ctx;
 
+   /* Layers of a layered framebuffer (JM Bifrost): each gets its own tiler
+    * context, framebuffer descriptor and fragment job. Only geometry shader
+    * draws writing gl_Layer reach layers past the first. */
+   unsigned nr_layers;
+
    /* Only used on midgard. */
    struct panfrost_bo *polygon_list_bo;
 

@@ -94,6 +94,10 @@ struct pan_gs_params {
    /* Added to gl_PrimitiveIDIn: the primitives of the earlier pieces of a draw the driver split
     * at its primitive restarts, which continue the count. */
    uint32_t prim_id_base;
+   /* Layered framebuffer: the index buffer holds layer_count regions of layer_stride indices, a
+    * primitive goes to the region of its gl_Layer, and every other region keeps dead slots. */
+   uint32_t layer_count;
+   uint32_t layer_stride;
 };
 
 #define PAN_GS_MAX_VIEWPORTS 16

@@ -6,6 +6,7 @@
  */
 
 #include "decode.h"
+#include "util/u_framebuffer.h"
 
 #include "drm-uapi/panfrost_drm.h"
 
@@ -38,6 +39,12 @@ GENX(jm_init_batch)(struct panfrost_batch *batch)
 #endif
    if (!batch->framebuffer.gpu)
       return -1;
+
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+   batch->nr_layers = MAX2(util_framebuffer_get_num_layers(&batch->key), 1);
+#else
+   batch->nr_layers = 1;
+#endif
 
 #if PAN_ARCH >= 6
    batch->tls = pan_pool_alloc_desc(&batch->pool.base, LOCAL_STORAGE);
@@ -285,6 +292,71 @@ GENX(jm_emit_fragment_job)(struct panfrost_batch *batch,
    batch->jm.jobs.frag = transfer.gpu;
 }
 
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+static uint64_t jm_emit_tiler_desc_layer(struct panfrost_batch *batch,
+                                         unsigned layer);
+#endif
+
+/* One layer of a layered framebuffer: its framebuffer descriptor (fb holds
+ * views narrowed to that layer) with the layer's tiler context, and a
+ * fragment job appended to the batch's chain. */
+void
+GENX(jm_emit_layer)(struct panfrost_batch *batch, struct pan_fb_info *fb,
+                    struct pan_tls_info *tls, unsigned layer)
+{
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+   struct pan_ptr fbd = batch->framebuffer;
+   if (layer > 0) {
+      fbd = pan_pool_alloc_desc_aggregate(
+         &batch->pool.base, PAN_DESC(FRAMEBUFFER), PAN_DESC(ZS_CRC_EXTENSION),
+         PAN_DESC_ARRAY(MAX2(batch->key.nr_cbufs, 1), RENDER_TARGET));
+      if (!fbd.gpu)
+         return;
+   }
+
+   const int crc_rt = GENX(pan_select_crc_rt)(fb, fb->tile_size);
+   const bool has_zs_ext = (fb->zs.view.zs || fb->zs.view.s || crc_rt >= 0);
+   const struct pan_fbd_descs fb_descs = {
+      .fbd = fbd.cpu,
+      .zs_crc = has_zs_ext ? fbd.cpu + pan_size(FRAMEBUFFER) : NULL,
+      .rts = has_zs_ext ? fbd.cpu + pan_size(FRAMEBUFFER) +
+                             pan_size(ZS_CRC_EXTENSION)
+                        : fbd.cpu + pan_size(FRAMEBUFFER),
+   };
+
+   struct pan_tiler_context tiler_ctx = batch->tiler_ctx;
+   if (tiler_ctx.bifrost.desc)
+      tiler_ctx.bifrost.desc = jm_emit_tiler_desc_layer(batch, layer);
+
+   uint64_t tagged = fbd.gpu | GENX(pan_emit_fbd)(fb, 0, tls, &tiler_ctx, &fb_descs);
+   if (layer == 0)
+      batch->framebuffer.gpu = tagged;
+
+   struct pan_ptr job = pan_pool_alloc_desc(&batch->pool.base, FRAGMENT_JOB);
+   if (!job.gpu)
+      return;
+
+   GENX(pan_emit_fragment_job_payload)(fb, tagged, job.cpu);
+   pan_section_pack(job.cpu, FRAGMENT_JOB, HEADER, header) {
+      header.type = MALI_JOB_TYPE_FRAGMENT;
+      header.index = layer + 1;
+   }
+
+   if (batch->jm.jobs.frag_last) {
+      /* Link it after the previous layer's job (next is the header's last
+       * 64 bits, as pan_jc_add_job patches it). */
+      struct mali_job_header_packed *prev = batch->jm.jobs.frag_last;
+      prev->opaque[6] = job.gpu;
+      prev->opaque[7] = job.gpu >> 32;
+   } else {
+      batch->jm.jobs.frag = job.gpu;
+   }
+   batch->jm.jobs.frag_last = job.cpu;
+#else
+   UNREACHABLE("layered framebuffers are only split on JM Bifrost");
+#endif
+}
+
 #if PAN_ARCH == 9
 static void
 jm_emit_shader_env(struct panfrost_batch *batch,
@@ -420,7 +492,8 @@ jm_emit_tiler_desc(struct panfrost_batch *batch)
    ASSERTED unsigned max_levels = dev->tiler_features.max_levels;
    assert(max_levels >= 2);
 
-   t = pan_pool_alloc_desc(&batch->pool.base, TILER_CONTEXT);
+   const unsigned nr_ctx = PAN_ARCH <= 7 ? MAX2(batch->nr_layers, 1) : 1;
+   t = pan_pool_alloc_desc_array(&batch->pool.base, nr_ctx, TILER_CONTEXT);
    pan_cast_and_pack(t.cpu, TILER_CONTEXT, tiler) {
       /* On JM, we don't care of passing the tile_size as it only matters for v12+ */
       tiler.hierarchy_mask = GENX(pan_select_tiler_hierarchy_mask)(
@@ -438,6 +511,10 @@ jm_emit_tiler_desc(struct panfrost_batch *batch)
 #endif
    }
 
+   /* One identical context per layer, each with its own polygon lists. */
+   for (unsigned l = 1; l < nr_ctx; l++)
+      memcpy(t.cpu + l * pan_size(TILER_CONTEXT), t.cpu, pan_size(TILER_CONTEXT));
+
    if (PAN_ARCH >= 9)
       batch->tiler_ctx.valhall.desc = t.gpu;
    else
@@ -445,6 +522,16 @@ jm_emit_tiler_desc(struct panfrost_batch *batch)
 
    return t.gpu;
 }
+
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+/* The tiler context of one layer of a layered framebuffer. */
+static uint64_t
+jm_emit_tiler_desc_layer(struct panfrost_batch *batch, unsigned layer)
+{
+   assert(layer < batch->nr_layers);
+   return jm_emit_tiler_desc(batch) + layer * pan_size(TILER_CONTEXT);
+}
+#endif
 #endif
 
 #if PAN_ARCH <= 7
@@ -1165,6 +1252,26 @@ GENX(jm_launch_draw_gs)(struct panfrost_batch *batch,
                                true, v, 0, &compute, false);
    pan_jc_add_job(&batch->jm.jobs.vtc_jc, MALI_JOB_TYPE_TILER, false, false, c, 0,
                   &tiler, false);
+
+   /* A layered framebuffer: the same tiler job per layer, over that layer's
+    * index region, into that layer's tiler context. */
+   for (unsigned l = 1; l < gs->layer_count; l++) {
+      struct pan_ptr t = pan_pool_alloc_desc(&batch->pool.base, TILER_JOB);
+      if (!t.cpu)
+         return;
+
+      memcpy(t.cpu, tiler.cpu, pan_size(TILER_JOB));
+      pan_section_unpack(tiler.cpu, TILER_JOB, PRIMITIVE, prim_cfg);
+      pan_section_pack(t.cpu, TILER_JOB, PRIMITIVE, cfg) {
+         cfg = prim_cfg;
+         cfg.indices = gs->out_index + (uint64_t)l * gs->layer_stride * 4;
+      }
+      pan_section_pack(t.cpu, TILER_JOB, TILER, cfg) {
+         cfg.address = jm_emit_tiler_desc_layer(batch, l);
+      }
+      pan_jc_add_job(&batch->jm.jobs.vtc_jc, MALI_JOB_TYPE_TILER, false, false,
+                     c, 0, &t, false);
+   }
 }
 #endif
 

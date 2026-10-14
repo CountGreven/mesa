@@ -457,6 +457,8 @@ struct panfrost_gs_draw {
    uint64_t gs_bufs, fs_consumer;
    uint64_t out_pos, out_psiz, out_index;
    uint32_t out_verts, index_count;
+   /* Index regions, one per layer of the framebuffer (pan_gs_params). */
+   uint32_t layer_count, layer_stride;
    /* Compute workgroups of PAN_GS_WORKGROUP_SIZE. */
    uint32_t wg;
    enum mesa_prim out_prim;

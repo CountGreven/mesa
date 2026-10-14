@@ -3580,7 +3580,8 @@ panfrost_gs_emit_out_varyings(struct panfrost_batch *batch, const struct pan_gs_
    struct pan_ptr psiz = {0};
    if (gsi->writes_psiz)
       psiz = pan_pool_alloc_aligned(&batch->pool.base, ALIGN_POT(out->out_verts * 2, 4), 64);
-   struct pan_ptr idx = pan_pool_alloc_aligned(&batch->pool.base, out->index_count * 4, 64);
+   struct pan_ptr idx = pan_pool_alloc_aligned(
+      &batch->pool.base, (uint64_t)out->index_count * 4 * out->layer_count, 64);
    if (!bufs.cpu || !pos.cpu || !gen.cpu || !idx.cpu || (gsi->writes_psiz && !psiz.cpu))
       return false;
 
@@ -3630,7 +3631,11 @@ panfrost_gs_emit_out_varyings(struct panfrost_batch *batch, const struct pan_gs_
                continue;
             }
 
-            const uint32_t offset = pan_gs_out_offset(gsi, slot->location);
+            /* gl_Layer and gl_ViewportIndex travel in the emulation's own slots (pan_gs.h). */
+            const unsigned loc = slot->location == VARYING_SLOT_LAYER    ? PAN_GS_LAYER_SLOT
+                                 : slot->location == VARYING_SLOT_VIEWPORT ? PAN_GS_VIEWPORT_SLOT
+                                                                         : slot->location;
+            const uint32_t offset = pan_gs_out_offset(gsi, loc);
             enum pipe_format format = PIPE_FORMAT_NONE;
             if (offset != PAN_GS_SLOT_UNUSED) {
                nir_alu_type base = nir_alu_type_get_base_type(slot->alu_type);
@@ -3687,6 +3692,9 @@ panfrost_gs_prepare(struct panfrost_batch *batch, const struct pipe_draw_info *i
    memset(out, 0, sizeof(*out));
    out->out_verts = out_verts;
    out->index_count = index_count;
+   out->layer_count =
+      (gsi->generic_mask & BITFIELD64_BIT(PAN_GS_LAYER_SLOT)) ? batch->nr_layers : 1;
+   out->layer_stride = index_count;
    out->wg = DIV_ROUND_UP(invocations, PAN_GS_WORKGROUP_SIZE);
    out->out_prim = gsi->output_verts == 3   ? MESA_PRIM_TRIANGLES
                    : gsi->output_verts == 2 ? MESA_PRIM_LINES
@@ -3718,6 +3726,8 @@ panfrost_gs_prepare(struct panfrost_batch *batch, const struct pipe_draw_info *i
    params->index_bias = info->index_size ? ctx->offset_start - draw->index_bias : 0;
    params->vertex_count = draw->count;
    params->flatshade_first = ctx->rasterizer->base.flatshade_first;
+   params->layer_count = out->layer_count;
+   params->layer_stride = out->layer_stride;
    if (ctx->gs_continue_prim_id) {
       params->prim_id_base = ctx->gs_prim_id_base;
       ctx->gs_prim_id_base += ppi;
@@ -5212,11 +5222,68 @@ init_polygon_list(struct panfrost_batch *batch)
 #endif
 }
 
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+/* A view of one layer (or z slice) of a layered attachment. A cube face is a
+ * layer of a 2D array in memory, so it becomes a plain 2D view. */
+static const struct pan_image_view *
+narrow_view(const struct pan_image_view *v, unsigned layer,
+            struct pan_image_view *out)
+{
+   if (!v)
+      return NULL;
+
+   *out = *v;
+   unsigned last = v->last_layer_or_z_slice;
+   out->first_layer_or_z_slice = MIN2(v->first_layer_or_z_slice + layer, last);
+   out->last_layer_or_z_slice = out->first_layer_or_z_slice;
+   if (out->dim == MALI_TEXTURE_DIMENSION_CUBE)
+      out->dim = MALI_TEXTURE_DIMENSION_2D;
+   return out;
+}
+
+/* A layered framebuffer: every layer is its own pass over the same jobs, with
+ * its own preload, framebuffer descriptor, tiler context and fragment job. */
+static void
+submit_layers(struct panfrost_batch *batch, struct pan_fb_info *fb)
+{
+   struct panfrost_device *dev = pan_device(batch->ctx->base.screen);
+   struct pan_tls_info tls = get_tls_info(dev, batch);
+
+   fb->sample_positions =
+      dev->sample_positions->ptr.gpu +
+      pan_sample_positions_offset(pan_sample_pattern(fb->nr_samples));
+
+   for (unsigned l = 0; l < batch->nr_layers; l++) {
+      struct pan_image_view views[ARRAY_SIZE(fb->rts) + 2];
+      struct pan_fb_info lfb = *fb;
+
+      for (unsigned i = 0; i < fb->rt_count; i++)
+         lfb.rts[i].view = narrow_view(fb->rts[i].view, l, &views[i]);
+
+      lfb.zs.view.zs = narrow_view(fb->zs.view.zs, l, &views[8]);
+      lfb.zs.view.s = fb->zs.view.s == fb->zs.view.zs
+                         ? lfb.zs.view.zs
+                         : narrow_view(fb->zs.view.s, l, &views[9]);
+
+      memset(&lfb.bifrost, 0, sizeof(lfb.bifrost));
+      JOBX(preload_fb)(batch, &lfb);
+      GENX(jm_emit_layer)(batch, &lfb, &tls, l);
+   }
+}
+#endif
+
 static int
 submit_batch(struct panfrost_batch *batch, struct pan_fb_info *fb)
 {
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+   const bool layered = batch->nr_layers > 1;
+#else
+   const bool layered = false;
+#endif
+
    JOBX(prepare_tiler)(batch, fb);
-   JOBX(preload_fb)(batch, fb);
+   if (!layered)
+      JOBX(preload_fb)(batch, fb);
    init_polygon_list(batch);
 
    /* Now that all jobs are in, we can finally prepare the batch. */
@@ -5261,8 +5328,15 @@ submit_batch(struct panfrost_batch *batch, struct pan_fb_info *fb)
                                                              .sb_wait_mask = BITFIELD_BIT(PANFROST_SB_RENDER) });
 #endif
 
-      emit_fbd(batch, fb);
-      emit_fragment_job(batch, fb);
+#if PAN_ARCH == 6 || PAN_ARCH == 7
+      if (layered) {
+         submit_layers(batch, fb);
+      } else
+#endif
+      {
+         emit_fbd(batch, fb);
+         emit_fragment_job(batch, fb);
+      }
 
 #if PAN_ARCH >= 10
       trace_panfrost_end_fragment(&batch->trace, &_tcs, submit_id, cbuf0_fmt,

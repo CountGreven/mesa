@@ -18,8 +18,11 @@ struct panfrost_jm_batch {
       /* Vertex/tiler/compute job chain. */
       struct pan_jc vtc_jc;
 
-      /* Fragment job, only one per batch. */
+      /* Fragment job chain: one per batch, or one per layer of a layered
+       * framebuffer (frag_last is the CPU side of the last one, to link the
+       * next). */
       uint64_t frag;
+      void *frag_last;
    } jobs;
 };
 
@@ -61,6 +64,9 @@ void GENX(jm_emit_fbds)(struct panfrost_batch *batch, struct pan_fb_info *fb,
                         struct pan_tls_info *tls);
 void GENX(jm_emit_fragment_job)(struct panfrost_batch *batch,
                                 const struct pan_fb_info *pfb);
+
+void GENX(jm_emit_layer)(struct panfrost_batch *batch, struct pan_fb_info *fb,
+                         struct pan_tls_info *tls, unsigned layer);
 
 void GENX(jm_launch_xfb)(struct panfrost_batch *batch,
                          const struct pipe_draw_info *info, unsigned count);

@@ -101,6 +101,10 @@ struct lower_gs_state {
    nir_def *out_vtx_base, *out_idx_base;
    nir_variable *prims_written;
    nir_def *prims_written_addr;
+   /* Layered framebuffer: index regions (pan_gs_params::layer_count) and the gl_Layer of the
+    * vertex emitted last, which places the primitive it ends. */
+   nir_def *layer_count, *layer_stride;
+   nir_variable *cur_layer;
 
    /* The current value of every output slot, 4 x 32-bit. */
    nir_variable *outputs[64];
@@ -338,11 +342,30 @@ lower_store_output(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_st
 }
 
 /* EmitVertex(): the whole current vertex into this invocation's slot. */
+/* Writes index value v to slot idx_slot of the current layer's region; a primitive whose layer
+ * is outside the framebuffer is dropped (its slots stay dead). */
+static void
+store_index(nir_builder *b, struct lower_gs_state *st, nir_def *idx_slot, nir_def *v)
+{
+   nir_def *layer = nir_load_var(b, st->cur_layer);
+   nir_push_if(b, nir_ult(b, layer, st->layer_count));
+   {
+      nir_def *slot = nir_iadd(b, nir_imul(b, layer, st->layer_stride), idx_slot);
+      nir_def *addr = nir_iadd(b, st->out_index, nir_u2u64(b, nir_imul_imm(b, slot, 4)));
+      nir_store_global(b, v, addr, .align_mul = 4, .write_mask = 0x1);
+   }
+   nir_pop_if(b, NULL);
+}
+
 static void
 lower_emit_vertex(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_state *st)
 {
    const struct pan_gs_info *info = st->info;
    nir_def *counter = intr->src[0].ssa;
+
+   if (st->outputs[VARYING_SLOT_LAYER])
+      nir_store_var(b, st->cur_layer,
+                    nir_channel(b, nir_load_var(b, st->outputs[VARYING_SLOT_LAYER]), 0), 1);
 
    /* A shader that emits more than it declared must not write into the next slot. */
    nir_push_if(b, nir_ult_imm(b, counter, info->max_verts));
@@ -415,12 +438,8 @@ lower_emit_vertex(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_sta
       }
 
       /* Points: nir_lower_gs_intrinsics removes EndPrimitive, every vertex is a point. */
-      if (info->output_verts == 1) {
-         nir_def *addr = nir_iadd(
-            b, st->out_index,
-            nir_u2u64(b, nir_imul_imm(b, nir_iadd(b, st->out_idx_base, counter), 4)));
-         nir_store_global(b, slot, addr, .align_mul = 4, .write_mask = 0x1);
-      }
+      if (info->output_verts == 1)
+         store_index(b, st, nir_iadd(b, st->out_idx_base, counter), slot);
    }
    nir_pop_if(b, NULL);
 }
@@ -469,9 +488,7 @@ lower_end_primitive(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_s
                v = nir_bcsel(b, odd, odd_v, v);
             }
 
-            nir_def *addr = nir_iadd(
-               b, st->out_index, nir_u2u64(b, nir_imul_imm(b, nir_iadd_imm(b, idx_slot, k), 4)));
-            nir_store_global(b, v, addr, .align_mul = 4, .write_mask = 0x1);
+            store_index(b, st, nir_iadd_imm(b, idx_slot, k), v);
          }
       }
       nir_pop_if(b, NULL);
@@ -499,18 +516,24 @@ emit_degenerate_fill(nir_builder *b, struct lower_gs_state *st)
    nir_variable *i = nir_local_variable_create(b->impl, glsl_uint_type(), "gs_fill_i");
    nir_store_var(b, i, nir_imm_int(b, 0), 1);
 
+   /* The invocation's slots in every layer's region. */
+   nir_def *end = nir_imul_imm(b, st->layer_count, total);
+
    nir_push_loop(b);
    {
-      nir_def *iv = nir_load_var(b, i);
-      nir_push_if(b, nir_uge_imm(b, iv, total));
+      nir_def *j = nir_load_var(b, i);
+      nir_push_if(b, nir_uge(b, j, end));
       nir_jump(b, nir_jump_break);
       nir_pop_if(b, NULL);
 
-      nir_def *addr = nir_iadd(
-         b, st->out_index, nir_u2u64(b, nir_imul_imm(b, nir_iadd(b, st->out_idx_base, iv), 4)));
+      nir_def *region = nir_udiv_imm(b, j, total);
+      nir_def *iv = nir_isub(b, j, nir_imul_imm(b, region, total));
+      nir_def *slot = nir_iadd(b, nir_imul(b, region, st->layer_stride),
+                               nir_iadd(b, st->out_idx_base, iv));
+      nir_def *addr = nir_iadd(b, st->out_index, nir_u2u64(b, nir_imul_imm(b, slot, 4)));
       nir_store_global(b, st->dead_vertex, addr, .align_mul = 4, .write_mask = 0x1);
 
-      nir_store_var(b, i, nir_iadd_imm(b, iv, 1), 1);
+      nir_store_var(b, i, nir_iadd_imm(b, j, 1), 1);
    }
    nir_pop_loop(b, NULL);
 }
@@ -587,6 +610,8 @@ pan_nir_lower_gs(nir_shader *nir, const struct pan_gs_info *info, uint32_t noper
 
    st.prims_written = nir_local_variable_create(impl, glsl_uint_type(), "gs_prims_written");
    nir_store_var(&b, st.prims_written, nir_imm_int(&b, 0), 1);
+   st.cur_layer = nir_local_variable_create(impl, glsl_uint_type(), "gs_cur_layer");
+   nir_store_var(&b, st.cur_layer, nir_imm_int(&b, 0), 1);
 
    load_input_params(&b, &st);
    st.out_pos = PARAM64(&b, &st, out_pos);
@@ -595,6 +620,8 @@ pan_nir_lower_gs(nir_shader *nir, const struct pan_gs_info *info, uint32_t noper
    st.out_index = PARAM64(&b, &st, out_index);
    st.flatshade_first = PARAM32(&b, &st, flatshade_first);
    st.dead_vertex = PARAM32(&b, &st, dead_vertex);
+   st.layer_count = PARAM32(&b, &st, layer_count);
+   st.layer_stride = PARAM32(&b, &st, layer_stride);
    st.prims_written_addr = PARAM64(&b, &st, prims_written_addr);
    nir_def *num_prims = PARAM32(&b, &st, num_input_prims);
 
