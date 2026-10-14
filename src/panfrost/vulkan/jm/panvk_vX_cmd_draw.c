@@ -341,8 +341,12 @@ panvk_draw_prepare_fs_rsd(struct panvk_cmd_buffer *cmdbuf,
       cfg.multisample_misc.fixed_function_near_discard =
       cfg.multisample_misc.fixed_function_far_discard =
          vk_rasterization_state_depth_clip_enable(rs);
-      cfg.multisample_misc.fixed_function_depth_range_fixed =
-         !rs->depth_clamp_enable;
+      /* "Depth range fixed" makes the near/far discard use [0, 1] instead
+       * of the viewport depth range. Depth clipping has to discard what
+       * falls outside clip-space z in [0, 1], which is the viewport range
+       * once mapped, also when that range is inverted or narrower.
+       */
+      cfg.multisample_misc.fixed_function_depth_range_fixed = false;
       cfg.multisample_misc.shader_depth_range_fixed = true;
 
       cfg.stencil_mask_misc.stencil_enable = test_s;
