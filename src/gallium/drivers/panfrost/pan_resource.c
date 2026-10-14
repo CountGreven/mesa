@@ -1177,10 +1177,23 @@ panfrost_resource_create_with_modifiers(struct pipe_screen *screen,
    PANFROST_EMULATED_MODIFIERS(emulated_mods);
    PAN_SUPPORTED_MODIFIERS(native_mods);
 
-   for (unsigned i = 0; i < ARRAY_SIZE(native_mods); ++i) {
-      if (drm_find_modifier(native_mods[i], modifiers, count)) {
-         return panfrost_resource_create_with_modifier(screen, template,
-                                                       native_mods[i], 0);
+   /* v6 can't render to wide AFBC superblocks without racing (see
+    * pan_mod_afbc_test_props), so prefer anything else for render targets.
+    */
+   const bool avoid_wide =
+      pan_device(screen)->arch <= 6 &&
+      (template->bind & PIPE_BIND_RENDER_TARGET);
+
+   for (unsigned pass = avoid_wide ? 0 : 1; pass < 2; ++pass) {
+      for (unsigned i = 0; i < ARRAY_SIZE(native_mods); ++i) {
+         if (pass == 0 && drm_is_afbc(native_mods[i]) &&
+             pan_afbc_superblock_width(native_mods[i]) != 16)
+            continue;
+
+         if (drm_find_modifier(native_mods[i], modifiers, count)) {
+            return panfrost_resource_create_with_modifier(screen, template,
+                                                          native_mods[i], 0);
+         }
       }
    }
 
