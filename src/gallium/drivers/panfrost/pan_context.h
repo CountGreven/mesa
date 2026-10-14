@@ -265,6 +265,11 @@ struct panfrost_context {
    /* A geometry shader transform feedback capture flushed every batch: a
     * draw loop must fetch the current batch again. */
    bool gs_xfb_flushed;
+   /* Vertex shader transform feedback into scratch for a CPU gather
+    * (panfrost_vs_xfb_gather): the XFB sysval of buffer b points at
+    * vs_xfb_scratch + vs_xfb_scratch_offset[b] while it is set. */
+   uint64_t vs_xfb_scratch;
+   uint32_t vs_xfb_scratch_offset[PIPE_MAX_SO_BUFFERS];
    bool cond_cond;
    enum pipe_render_cond_flag cond_mode;
 

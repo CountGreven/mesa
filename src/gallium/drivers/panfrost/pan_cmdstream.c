@@ -1367,6 +1367,12 @@ panfrost_upload_sysvals(struct panfrost_batch *batch, void *ptr_cpu,
             break;
          }
 
+         if (batch->ctx->vs_xfb_scratch) {
+            uniforms[i].du[0] = batch->ctx->vs_xfb_scratch +
+                                batch->ctx->vs_xfb_scratch_offset[buf];
+            break;
+         }
+
          struct panfrost_resource *rsrc = pan_resource(target->buffer);
          unsigned offset = panfrost_xfb_offset(stride, target);
 
@@ -3299,14 +3305,12 @@ panfrost_launch_xfb(struct panfrost_batch *batch,
 {
    struct panfrost_context *ctx = batch->ctx;
 
-   /* Nothing to do */
-   if (batch->ctx->streamout.num_targets == 0)
+   /* Into scratch every vertex of the range is captured (panfrost_vs_xfb_gather). */
+   if (!ctx->vs_xfb_scratch && !u_trim_pipe_prim(info->mode, &count))
       return;
 
-   /* TODO: XFB with index buffers */
-   // assert(info->index_size == 0);
-
-   if (!u_trim_pipe_prim(info->mode, &count))
+   /* Nothing to do */
+   if (batch->ctx->streamout.num_targets == 0)
       return;
 
    perf_debug(batch->ctx, "Emulating transform feedback");
@@ -3878,6 +3882,198 @@ panfrost_gs_prepare(struct panfrost_batch *batch, const struct pipe_draw_info *i
 }
 #endif
 
+/* Vertex shader transform feedback the XFB variant cannot write in place: an indexed draw, a
+ * strip, fan or loop (captured as independent primitives), or more primitives than the buffers
+ * hold (only whole primitives are captured). */
+static bool
+panfrost_vs_xfb_needs_gather(struct panfrost_context *ctx, const struct pipe_draw_info *info,
+                             const struct pipe_draw_start_count_bias *draw)
+{
+   if (info->index_size)
+      return true;
+
+   if (info->mode != MESA_PRIM_POINTS && info->mode != MESA_PRIM_LINES &&
+       info->mode != MESA_PRIM_TRIANGLES)
+      return true;
+
+   const struct pipe_stream_output_info *so = &ctx->prog[MESA_SHADER_VERTEX]->stream_output;
+   const unsigned verts =
+      u_stream_outputs_for_vertices(info->mode, draw->count) * info->instance_count;
+
+   for (unsigned b = 0; b < ctx->streamout.num_targets && b < PIPE_MAX_SO_BUFFERS; b++) {
+      struct pipe_stream_output_target *t = ctx->streamout.targets[b];
+      if (!t || !so->stride[b])
+         continue;
+
+      if (pan_so_target(t)->offset + verts > t->buffer_size / (so->stride[b] * 4))
+         return true;
+   }
+
+   return false;
+}
+
+/* After the draw ran: assemble its primitives from the scratch records (every vertex of the
+ * draw's range, per instance) in GL's capture order and write each whole primitive that still
+ * fits, then advance the offsets. */
+static void
+panfrost_vs_xfb_gather(struct panfrost_context *ctx, const struct pipe_draw_info *info,
+                       const struct pipe_draw_start_count_bias *draw,
+                       const struct pipe_stream_output_info *so, struct panfrost_bo *scratch,
+                       unsigned range, unsigned base)
+{
+   const uint8_t *src = scratch->ptr.cpu;
+   uint8_t *dst[PIPE_MAX_SO_BUFFERS] = {0};
+   unsigned stride[PIPE_MAX_SO_BUFFERS] = {0}, cap[PIPE_MAX_SO_BUFFERS] = {0};
+   unsigned off[PIPE_MAX_SO_BUFFERS] = {0};
+
+   for (unsigned b = 0; b < ctx->streamout.num_targets && b < PIPE_MAX_SO_BUFFERS; b++) {
+      struct pipe_stream_output_target *t = ctx->streamout.targets[b];
+      if (!t || !so->stride[b])
+         continue;
+
+      struct panfrost_resource *rsrc = pan_resource(t->buffer);
+      if (panfrost_bo_mmap(rsrc->bo) || !panfrost_bo_wait(rsrc->bo, INT64_MAX, true))
+         continue;
+
+      stride[b] = so->stride[b] * 4;
+      dst[b] = (uint8_t *)rsrc->bo->ptr.cpu + t->buffer_offset;
+      cap[b] = t->buffer_size / stride[b];
+      off[b] = pan_so_target(t)->offset;
+      util_range_add(&rsrc->base, &rsrc->valid_buffer_range, t->buffer_offset,
+                     t->buffer_offset + t->buffer_size);
+   }
+
+   const void *ib = NULL;
+   struct pipe_transfer *transfer = NULL;
+   if (info->index_size) {
+      if (info->has_user_indices) {
+         ib = (const uint8_t *)info->index.user + draw->start * info->index_size;
+      } else {
+         ib = pipe_buffer_map_range(&ctx->base, info->index.resource,
+                                    draw->start * info->index_size,
+                                    draw->count * info->index_size, PIPE_MAP_READ, &transfer);
+         if (!ib)
+            return;
+      }
+   }
+
+   const enum mesa_prim prim = u_reduced_prim(info->mode);
+   const unsigned vpp = prim == MESA_PRIM_TRIANGLES ? 3 : prim == MESA_PRIM_LINES ? 2 : 1;
+   const bool first_pv = ctx->rasterizer->base.flatshade_first;
+   uint32_t *seq = malloc(MAX2(draw->count, 1) * sizeof(uint32_t));
+   unsigned written = 0;
+   bool full = !seq;
+
+   for (unsigned inst = 0; inst < info->instance_count && !full; inst++) {
+      unsigned n = 0;
+
+      for (unsigned k = 0; k <= draw->count && !full; k++) {
+         bool end = k == draw->count;
+         uint32_t v = 0;
+
+         if (!end && info->index_size) {
+            const uint32_t i = info->index_size == 1   ? ((const uint8_t *)ib)[k]
+                               : info->index_size == 2 ? ((const uint16_t *)ib)[k]
+                                                       : ((const uint32_t *)ib)[k];
+            if (info->primitive_restart && i == info->restart_index)
+               end = true;
+            else
+               v = i + draw->index_bias - base;
+         } else if (!end) {
+            v = k;
+         }
+
+         if (!end) {
+            seq[n++] = v;
+            continue;
+         }
+
+         /* The primitives of the vertices since the last restart, as GL captures them. */
+         unsigned nprims;
+         switch (info->mode) {
+         case MESA_PRIM_LINE_STRIP: nprims = n >= 2 ? n - 1 : 0; break;
+         case MESA_PRIM_LINE_LOOP: nprims = n >= 2 ? n : 0; break;
+         case MESA_PRIM_TRIANGLE_STRIP:
+         case MESA_PRIM_TRIANGLE_FAN: nprims = n >= 3 ? n - 2 : 0; break;
+         default: nprims = n / vpp; break;
+         }
+
+         for (unsigned p = 0; p < nprims && !full; p++) {
+            unsigned pv[3];
+            switch (info->mode) {
+            case MESA_PRIM_LINE_STRIP:
+               pv[0] = p, pv[1] = p + 1;
+               break;
+            case MESA_PRIM_LINE_LOOP:
+               pv[0] = p, pv[1] = (p + 1) % n;
+               break;
+            case MESA_PRIM_TRIANGLE_STRIP:
+               if (!(p & 1))
+                  pv[0] = p, pv[1] = p + 1, pv[2] = p + 2;
+               else if (first_pv)
+                  pv[0] = p, pv[1] = p + 2, pv[2] = p + 1;
+               else
+                  pv[0] = p + 1, pv[1] = p, pv[2] = p + 2;
+               break;
+            case MESA_PRIM_TRIANGLE_FAN:
+               if (first_pv)
+                  pv[0] = p + 1, pv[1] = p + 2, pv[2] = 0;
+               else
+                  pv[0] = 0, pv[1] = p + 1, pv[2] = p + 2;
+               break;
+            default:
+               for (unsigned j = 0; j < vpp; j++)
+                  pv[j] = p * vpp + j;
+               break;
+            }
+
+            for (unsigned b = 0; b < PIPE_MAX_SO_BUFFERS; b++) {
+               if (dst[b] && off[b] + vpp > cap[b])
+                  full = true;
+            }
+            if (full)
+               break;
+
+            for (unsigned j = 0; j < vpp; j++) {
+               const uint64_t rec = (uint64_t)inst * range + seq[pv[j]];
+
+               for (unsigned o = 0; o < so->num_outputs; o++) {
+                  const struct pipe_stream_output *out = &so->output[o];
+                  const unsigned b = out->output_buffer;
+                  if (!dst[b])
+                     continue;
+
+                  memcpy(dst[b] + (uint64_t)(off[b] + j) * stride[b] + out->dst_offset * 4,
+                         src + ctx->vs_xfb_scratch_offset[b] + rec * stride[b] +
+                            out->dst_offset * 4,
+                         out->num_components * 4);
+               }
+            }
+
+            for (unsigned b = 0; b < PIPE_MAX_SO_BUFFERS; b++) {
+               if (dst[b])
+                  off[b] += vpp;
+            }
+            written++;
+         }
+         n = 0;
+      }
+   }
+
+   free(seq);
+   if (transfer)
+      pipe_buffer_unmap(&ctx->base, transfer);
+
+   for (unsigned b = 0; b < ctx->streamout.num_targets && b < PIPE_MAX_SO_BUFFERS; b++) {
+      if (dst[b])
+         pan_so_target(ctx->streamout.targets[b])->offset = off[b];
+   }
+
+   /* panfrost_statistics_record counted the draw's primitives as written. */
+   if (ctx->active_queries)
+      ctx->tf_prims_generated += written - u_prims_for_vertices(info->mode, draw->count);
+}
+
 static void
 panfrost_single_draw_direct(struct panfrost_batch *batch,
                             const struct pipe_draw_info *info,
@@ -3985,18 +4181,61 @@ panfrost_single_draw_direct(struct panfrost_batch *batch,
    }
 #endif
 
-   if (ctx->uncompiled[MESA_SHADER_VERTEX]->xfb) {
-      panfrost_launch_xfb(batch, info, draw->count);
-   }
+   struct panfrost_bo *xfb_scratch = NULL;
+   struct pipe_stream_output_info xfb_so;
+   unsigned xfb_range = 0, xfb_base = 0;
 
-   /* Increment transform feedback offsets */
-   panfrost_update_streamout_offsets(ctx);
+   if (ctx->uncompiled[MESA_SHADER_VERTEX]->xfb && ctx->streamout.num_targets &&
+       panfrost_vs_xfb_needs_gather(ctx, info, draw)) {
+      /* Every vertex of the draw's range, per instance, into scratch. */
+      xfb_so = ctx->prog[MESA_SHADER_VERTEX]->stream_output;
+      xfb_range = info->index_size ? vertex_count : draw->count;
+      xfb_base = ctx->offset_start;
+
+      uint32_t size = 0;
+      for (unsigned b = 0; b < PIPE_MAX_SO_BUFFERS; b++) {
+         ctx->vs_xfb_scratch_offset[b] = size;
+         size += ALIGN_POT(xfb_range * info->instance_count * xfb_so.stride[b] * 4, 64);
+      }
+
+      xfb_scratch = size ? panfrost_bo_create(pan_device(ctx->base.screen), size, 0,
+                                              "Transform feedback scratch")
+                         : NULL;
+      if (xfb_scratch && !panfrost_bo_mmap(xfb_scratch)) {
+         panfrost_batch_add_bo(batch, xfb_scratch);
+
+         const unsigned saved_count = ctx->vertex_count;
+         ctx->vs_xfb_scratch = xfb_scratch->ptr.gpu;
+         ctx->vertex_count = xfb_range;
+         panfrost_launch_xfb(batch, info, xfb_range);
+         ctx->vertex_count = saved_count;
+         ctx->vs_xfb_scratch = 0;
+      } else if (xfb_scratch) {
+         panfrost_bo_unreference(xfb_scratch);
+         xfb_scratch = NULL;
+      }
+   } else if (ctx->uncompiled[MESA_SHADER_VERTEX]->xfb) {
+      panfrost_launch_xfb(batch, info, draw->count);
+
+      /* Increment transform feedback offsets */
+      panfrost_update_streamout_offsets(ctx);
+   } else {
+      panfrost_update_streamout_offsets(ctx);
+   }
 
    /* Any side effects must be handled by the XFB shader, so we only need
     * to run vertex shaders if we need rasterization.
     */
-   if (panfrost_batch_skip_rasterization(batch))
+   if (panfrost_batch_skip_rasterization(batch)) {
+      if (xfb_scratch) {
+         panfrost_flush_all_batches(ctx, "vertex shader transform feedback");
+         panfrost_bo_wait(xfb_scratch, INT64_MAX, true);
+         panfrost_vs_xfb_gather(ctx, info, draw, &xfb_so, xfb_scratch, xfb_range, xfb_base);
+         panfrost_bo_unreference(xfb_scratch);
+         ctx->gs_xfb_flushed = true;
+      }
       return;
+   }
 
 #if PAN_ARCH <= 7
    /* Emit all sort of descriptors. */
@@ -4014,6 +4253,14 @@ panfrost_single_draw_direct(struct panfrost_batch *batch,
    if (vertex_count > 0)
       JOBX(launch_draw)(batch, info, drawid_offset, draw, vertex_count);
    batch->draw_count++;
+
+   if (xfb_scratch) {
+      panfrost_flush_all_batches(ctx, "vertex shader transform feedback");
+      panfrost_bo_wait(xfb_scratch, INT64_MAX, true);
+      panfrost_vs_xfb_gather(ctx, info, draw, &xfb_so, xfb_scratch, xfb_range, xfb_base);
+      panfrost_bo_unreference(xfb_scratch);
+      ctx->gs_xfb_flushed = true;
+   }
 }
 
 static bool
