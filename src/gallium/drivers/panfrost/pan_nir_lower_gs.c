@@ -572,6 +572,14 @@ lower_gs_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       nir_instr_remove(&intr->instr);
       return true;
    case nir_intrinsic_set_vertex_and_primitive_count:
+      /* Points have no EndPrimitive to count them (lower_end_primitive): each vertex that got
+       * a slot is one. */
+      if (st->info->output_verts == 1) {
+         nir_def *n = nir_umin(b, intr->src[0].ssa, nir_imm_int(b, st->info->max_verts));
+         nir_push_if(b, nir_ine_imm(b, st->prims_written_addr, 0));
+         nir_global_atomic(b, 32, st->prims_written_addr, n, .atomic_op = nir_atomic_op_iadd);
+         nir_pop_if(b, NULL);
+      }
       nir_instr_remove(&intr->instr);
       return true;
    case nir_intrinsic_load_primitive_id:

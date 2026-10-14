@@ -3064,7 +3064,8 @@ panfrost_statistics_record(struct panfrost_context *ctx,
    uint32_t prims = u_prims_for_vertices(info->mode, draw->count);
    ctx->prims_generated += prims;
 
-   if (!ctx->streamout.num_targets)
+   /* A geometry shader's capture counts what it writes (panfrost_gs_capture_xfb). */
+   if (!ctx->streamout.num_targets || ctx->uncompiled[MESA_SHADER_GEOMETRY])
       return;
 
    ctx->tf_prims_generated += prims;
