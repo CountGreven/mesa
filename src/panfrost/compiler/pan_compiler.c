@@ -487,6 +487,10 @@ pan_nir_lower_mediump_io(nir_shader *nir)
       modes = nir_var_shader_out;
       break;
    case MESA_SHADER_FRAGMENT:
+      /* Only a vertex shader writes 16-bit varyings: the geometry shader
+       * emulation writes every output as 32 bits. */
+      if (nir->info.prev_stage != MESA_SHADER_VERTEX)
+         return;
       modes = nir_var_shader_in;
       break;
    default:
