@@ -5387,6 +5387,12 @@ submit_layers(struct panfrost_batch *batch, struct pan_fb_info *fb)
    struct panfrost_device *dev = pan_device(batch->ctx->base.screen);
    struct pan_tls_info tls = get_tls_info(dev, batch);
 
+   /* Written, as emit_fragment_job marks them: an unmarked level reads back and preloads as
+    * undefined. */
+   for (unsigned i = 0; i < batch->key.nr_cbufs; ++i)
+      panfrost_initialize_surface(batch, &batch->key.cbufs[i]);
+   panfrost_initialize_surface(batch, &batch->key.zsbuf);
+
    fb->sample_positions =
       dev->sample_positions->ptr.gpu +
       pan_sample_positions_offset(pan_sample_pattern(fb->nr_samples));
