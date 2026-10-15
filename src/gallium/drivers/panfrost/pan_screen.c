@@ -481,8 +481,12 @@ panfrost_walk_dmabuf_modifiers(struct pipe_screen *screen,
       if (max > (int)count) {
          modifiers[count] = emulated_mods[i];
 
+         /* Single planes of an emulated-modifier image (R8/GR88 for MTK
+          * tiled NV12) are detiled into a shadow when sampled and work as
+          * plain 2D textures; compositors such as kwin import and sample YUV
+          * buffers plane by plane as GL_TEXTURE_2D. */
          if (external_only)
-            external_only[count] = true;
+            external_only[count] = is_yuv;
       }
       count++;
    }
