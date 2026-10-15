@@ -827,6 +827,32 @@ lookup_ycbcr_conversion(const void *_state, uint32_t set,
    return conversion;
 }
 
+#if PAN_ARCH <= 6
+static bool
+lookup_ycbcr_luma_linear(const void *_state, uint32_t set, uint32_t binding,
+                         uint32_t array_index)
+{
+   const struct lower_ycbcr_state *state = _state;
+   const struct panvk_descriptor_set_layout *set_layout =
+      to_panvk_descriptor_set_layout(state->set_layouts[set]);
+   const struct panvk_descriptor_set_binding_layout *bind_layout =
+      &set_layout->bindings[binding];
+
+   if (bind_layout->immutable_samplers == NULL)
+      return false;
+
+   array_index = MIN2(array_index, bind_layout->desc_count - 1);
+   const struct panvk_sampler *sampler =
+      bind_layout->immutable_samplers[array_index];
+   if (!sampler)
+      return false;
+
+   /* The first descriptor samples the luma plane. */
+   pan_unpack(&sampler->descs[0], SAMPLER, cfg);
+   return !cfg.minify_nearest && !cfg.magnify_nearest;
+}
+#endif
+
 static unsigned
 glsl_type_size(const struct glsl_type *type, bool bindless)
 {
@@ -861,8 +887,17 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
       .set_layout_count = set_layout_count,
       .set_layouts = set_layouts,
    };
-   NIR_PASS(_, nir, nir_vk_lower_ycbcr_tex, lookup_ycbcr_conversion,
-            &ycbcr_state);
+   /* v6 quantizes the four bilinear corner weights instead of the two axis
+    * weights, which puts 16-bit chroma off the spec's precision model: filter
+    * LINEAR chroma in the shader there. */
+   const struct nir_vk_lower_ycbcr_tex_options ycbcr_opts = {
+      .explicit_linear_chroma = PAN_ARCH <= 6,
+#if PAN_ARCH <= 6
+      .explicit_linear_luma = lookup_ycbcr_luma_linear,
+#endif
+   };
+   NIR_PASS(_, nir, nir_vk_lower_ycbcr_tex_opts, lookup_ycbcr_conversion,
+            &ycbcr_state, &ycbcr_opts);
 
    /* We need to do this before nir_lower_descriptors so any image_deref_size
     * intrinsics generated can be lowered there.
