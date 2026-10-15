@@ -1498,8 +1498,10 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
          return;
 
       if (vs->info.vs.idvs) {
+         /* The setup dependency goes in dep1: pan_jc_add_job replaces dep2
+          * of every tiler job but the first with the previous tiler job. */
          pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_INDEXED_VERTEX, false,
-                        false, 0, copy_desc_job_id, &draw->jobs.idvs, false);
+                        false, copy_desc_job_id, 0, &draw->jobs.idvs, false);
       } else {
          unsigned vjob_id =
             pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_VERTEX, false, false,
@@ -1718,7 +1720,7 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
 
       if (vs->info.vs.idvs) {
          pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_INDEXED_VERTEX, false,
-                        false, 0, prev_job, &draw->jobs.idvs, false);
+                        false, prev_job, 0, &draw->jobs.idvs, false);
       } else {
          unsigned vjob_id =
             pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_VERTEX, false, true, 0,
@@ -1933,7 +1935,7 @@ panvk_cmd_draw_indexed_indirect_multi(struct panvk_cmd_buffer *cmdbuf,
    for (uint32_t i = 0; i < draw_count; i++) {
       if (vs->info.vs.idvs) {
          pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_INDEXED_VERTEX, false,
-                        false, 0, helper_job, &jobs[i * 3 + 0], false);
+                        false, helper_job, 0, &jobs[i * 3 + 0], false);
       } else {
          unsigned vjob_id =
             pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_VERTEX, false, true, 0,
