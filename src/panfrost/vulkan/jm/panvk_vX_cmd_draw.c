@@ -1058,7 +1058,7 @@ panvk_draw_prepare_tiler_job(struct panvk_cmd_buffer *cmdbuf,
                              struct panvk_draw_data *draw)
 {
    struct panvk_batch *batch = cmdbuf->cur_batch;
-   struct pan_ptr ptr;
+   struct pan_ptr ptr = {0};
 
    if (cmdbuf->state.gfx.fs.required) {
       const struct panvk_shader_desc_info *fs_desc_info =
