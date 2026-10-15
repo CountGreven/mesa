@@ -445,6 +445,7 @@ struct panvk_draw_info {
    enum mesa_prim prim;
 
 #if PAN_ARCH < 9
+   uint32_t draw_id;
    uint32_t layer_id;
 #endif
 };

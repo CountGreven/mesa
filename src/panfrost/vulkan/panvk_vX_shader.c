@@ -143,11 +143,9 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
       if (PAN_ARCH >= 10)
          return false;
 
-      /* TODO: We only implement single-draw direct and indirect draws, so this
-       * is sufficient. We'll revisit this when we get around to implementing
-       * multidraw. */
+      /* On JM, multidraw is emulated by one indirect draw per draw id. */
       assert(b->shader->info.stage == MESA_SHADER_VERTEX);
-      val = nir_imm_int(b, 0);
+      val = load_sysval(b, graphics, bit_size, vs.draw_id);
       break;
 
    case nir_intrinsic_load_printf_buffer_address:
@@ -594,6 +592,19 @@ is_robust_ssbo_intr(const nir_intrinsic_instr *intr, UNUSED const void *data)
 }
 
 static bool
+is_robust_image_atomic_intr(const nir_intrinsic_instr *intr,
+                            UNUSED const void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
 valhall_lower_get_ssbo_size(struct nir_builder *b,
                             nir_intrinsic_instr *intr, void *data)
 {
@@ -816,6 +827,32 @@ lookup_ycbcr_conversion(const void *_state, uint32_t set,
    return conversion;
 }
 
+#if PAN_ARCH <= 6
+static bool
+lookup_ycbcr_luma_linear(const void *_state, uint32_t set, uint32_t binding,
+                         uint32_t array_index)
+{
+   const struct lower_ycbcr_state *state = _state;
+   const struct panvk_descriptor_set_layout *set_layout =
+      to_panvk_descriptor_set_layout(state->set_layouts[set]);
+   const struct panvk_descriptor_set_binding_layout *bind_layout =
+      &set_layout->bindings[binding];
+
+   if (bind_layout->immutable_samplers == NULL)
+      return false;
+
+   array_index = MIN2(array_index, bind_layout->desc_count - 1);
+   const struct panvk_sampler *sampler =
+      bind_layout->immutable_samplers[array_index];
+   if (!sampler)
+      return false;
+
+   /* The first descriptor samples the luma plane. */
+   pan_unpack(&sampler->descs[0], SAMPLER, cfg);
+   return !cfg.minify_nearest && !cfg.magnify_nearest;
+}
+#endif
+
 static unsigned
 glsl_type_size(const struct glsl_type *type, bool bindless)
 {
@@ -850,14 +887,34 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
       .set_layout_count = set_layout_count,
       .set_layouts = set_layouts,
    };
-   NIR_PASS(_, nir, nir_vk_lower_ycbcr_tex, lookup_ycbcr_conversion,
-            &ycbcr_state);
+   /* v6 quantizes the four bilinear corner weights instead of the two axis
+    * weights, which puts 16-bit chroma off the spec's precision model: filter
+    * LINEAR chroma in the shader there. */
+   const struct nir_vk_lower_ycbcr_tex_options ycbcr_opts = {
+      .explicit_linear_chroma = PAN_ARCH <= 6,
+#if PAN_ARCH <= 6
+      .explicit_linear_luma = lookup_ycbcr_luma_linear,
+#endif
+   };
+   NIR_PASS(_, nir, nir_vk_lower_ycbcr_tex_opts, lookup_ycbcr_conversion,
+            &ycbcr_state, &ycbcr_opts);
 
    /* We need to do this before nir_lower_descriptors so any image_deref_size
     * intrinsics generated can be lowered there.
     */
    if (PAN_ARCH < 9)
       NIR_PASS(_, nir, pan_nir_lower_image_ms);
+
+   /* Image atomics become LEA_ATTR_TEX + a global atomic on Bifrost. The
+    * address LEA_ATTR_TEX returns for an out-of-bounds texel is not safe to
+    * access (only ST_CVT drops it, through the conversion descriptor), so
+    * OOB atomics write stray memory and fault the job. Bounds-check them in
+    * the shader. Same ordering constraint as above for image_deref_size.
+    */
+   if (PAN_ARCH < 9 &&
+       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT)
+      NIR_PASS(_, nir, nir_lower_robust_access, is_robust_image_atomic_intr,
+               NULL);
 
    panvk_per_arch(nir_lower_descriptors)(nir, dev, rs, set_layout_count,
                                          set_layouts, state, desc_info);
@@ -1690,8 +1747,22 @@ compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       use_static_noperspective = true;
    }
 
+   /* Clip distances have no hardware on JM: the fragment shader discards
+    * where one is negative. It needs the vertex shader's count, which is only
+    * known when both are compiled together; alone (a pipeline library), it
+    * tests all of them, and unwritten ones read as constant 0.
+    */
+   uint8_t clip_mask = 0xff;
+   if (infos[0].nir->info.stage == MESA_SHADER_VERTEX)
+      clip_mask = BITFIELD_MASK(infos[0].nir->info.clip_distance_array_size);
+
    /* Vulkan runtime passes us shaders in stage order */
    for (i = 0; i < shader_count; i++) {
+#if PAN_ARCH <= 7
+      if (infos[i].stage == MESA_SHADER_FRAGMENT && clip_mask)
+         NIR_PASS(_, infos[i].nir, nir_lower_clip_fs, clip_mask, true, true);
+#endif
+
       const uint32_t *noperspective_varyings_ptr =
          use_static_noperspective ? &noperspective_varyings : NULL;
 
@@ -2362,7 +2433,7 @@ emit_varying_attrs(struct panvk_pool *desc_pool,
             gl_varying_slot loc = slot->location;
 
             enum pipe_format pfmt = PIPE_FORMAT_NONE;
-            bool is_hw = loc < VARYING_SLOT_VAR0;
+            bool is_hw = BITFIELD64_BIT(loc) & PAN_HARDWARE_VARYING_BITS;
             bool is_present = is_hw || bit_sizes[loc] != 0;
 
             if (is_present && !is_hw) {
@@ -2439,7 +2510,7 @@ panvk_per_arch(link_shaders)(struct panvk_pool *desc_pool,
 
       const gl_varying_slot pos = fs_var->location;
       /* Skip special varyings. */
-      if (pos < VARYING_SLOT_VAR0)
+      if (BITFIELD64_BIT(pos) & PAN_HARDWARE_VARYING_BITS)
          continue;
 
       /* Special buffers are handled explicitly before this loop, everything

@@ -1985,6 +1985,26 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
    case nir_intrinsic_ballot:
    case nir_intrinsic_ballot_relaxed: {
       assert(instr->src[0].ssa->bit_size == 32);
+
+      /* WMASK faults with INSTR_INVALID_ENC on v6. With four lanes, gather
+       * each lane's bit through the limited CLPER instead. */
+      if (b->shader->quirks & BIFROST_LIMITED_CLPER) {
+         assert(pan_subgroup_size(b->shader->arch) == 4);
+         bi_index lane = bi_fau(BIR_FAU_LANE_ID, false);
+         bi_index bit = bi_lshift_and_i32(b, bi_imm_u32(1),
+                                          bi_src_index(&instr->src[0]),
+                                          bi_byte(lane, 0));
+         bi_index mask = bi_clper(b, bit, bi_imm_u8(0), BI_LANE_OP_NONE);
+         for (unsigned i = 1; i < 4; ++i) {
+            mask = bi_lshift_or_i32(b, mask,
+                                    bi_clper(b, bit, bi_imm_u8(i),
+                                             BI_LANE_OP_NONE),
+                                    bi_imm_u8(0));
+         }
+         bi_mov_i32_to(b, dst, mask);
+         break;
+      }
+
       enum bi_subgroup subgroup =
          bi_subgroup_from_cluster_size(pan_subgroup_size(b->shader->arch));
       bi_wmask_to(b, dst, bi_src_index(&instr->src[0]), subgroup, 0);
@@ -1993,6 +2013,17 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
 
    case nir_intrinsic_read_invocation: {
       assert(instr->src[0].ssa->bit_size <= 32);
+
+      /* The limited CLPER on v6 behaves exactly like this: inactive lanes
+       * read zero, no lane op, subgroup of four. */
+      if (b->shader->quirks & BIFROST_LIMITED_CLPER) {
+         bi_mov_i32_to(b, dst,
+                       bi_clper(b, bi_src_index(&instr->src[0]),
+                                bi_byte(bi_src_index(&instr->src[1]), 0),
+                                BI_LANE_OP_NONE));
+         break;
+      }
+
       enum bi_inactive_result inactive_result = BI_INACTIVE_RESULT_ZERO;
       enum bi_lane_op lane_op = BI_LANE_OP_NONE;
       enum bi_subgroup subgroup =

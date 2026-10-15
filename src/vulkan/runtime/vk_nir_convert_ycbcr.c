@@ -110,6 +110,7 @@ struct ycbcr_state {
    nir_tex_src tex_handle;
    const struct vk_ycbcr_conversion_state *conversion;
    const struct vk_format_ycbcr_info *format_ycbcr_info;
+   bool explicit_linear_chroma;
 };
 
 /* TODO: we should probably replace this with a push constant/uniform. */
@@ -179,8 +180,8 @@ implicit_downsampled_coords(struct ycbcr_state *state,
 }
 
 static nir_def *
-create_plane_tex_instr_implicit(struct ycbcr_state *state,
-                                uint32_t plane)
+create_plane_tex_instr(struct ycbcr_state *state, uint32_t plane,
+                       nir_def *coord_override)
 {
    nir_builder *b = state->builder;
    const struct vk_ycbcr_conversion_state *conversion = state->conversion;
@@ -194,6 +195,10 @@ create_plane_tex_instr_implicit(struct ycbcr_state *state,
 
       switch (old_tex->src[i].src_type) {
       case nir_tex_src_coord:
+         if (coord_override) {
+            tex->src[i].src = nir_src_for_ssa(coord_override);
+            break;
+         }
          if (format_plane->has_chroma && conversion->chroma_reconstruction) {
             tex->src[i].src =
                nir_src_for_ssa(implicit_downsampled_coords(state,
@@ -229,6 +234,75 @@ create_plane_tex_instr_implicit(struct ycbcr_state *state,
    return &tex->def;
 }
 
+static nir_def *
+create_plane_tex_instr_implicit(struct ycbcr_state *state, uint32_t plane)
+{
+   return create_plane_tex_instr(state, plane, NULL);
+}
+
+static bool
+can_filter_explicitly(const nir_tex_instr *tex)
+{
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_shadow)
+      return false;
+
+   if (tex->op != nir_texop_tex && tex->op != nir_texop_txl &&
+       tex->op != nir_texop_txb)
+      return false;
+
+   return nir_tex_instr_src_index(tex, nir_tex_src_offset) < 0;
+}
+
+/* Bilinear filtering of a chroma plane in the shader: four samples at texel
+ * centres (where the hardware weights are exactly 0 or 1) mixed with fp32
+ * weights. YCbCr images have a single level and clamp to edge, so the sampler
+ * handles the borders.
+ */
+static nir_def *
+create_plane_tex_explicit_linear(struct ycbcr_state *state, uint32_t plane)
+{
+   nir_builder *b = state->builder;
+   const struct vk_ycbcr_conversion_state *conversion = state->conversion;
+   const struct vk_format_ycbcr_plane *format_plane =
+      &state->format_ycbcr_info->planes[plane];
+   nir_tex_instr *old_tex = state->origin_tex;
+   nir_def *coord =
+      old_tex->src[nir_tex_instr_src_index(old_tex, nir_tex_src_coord)].src.ssa;
+
+   if (format_plane->has_chroma && conversion->chroma_reconstruction)
+      coord = implicit_downsampled_coords(state, coord, format_plane);
+
+   nir_def *image_size = get_texture_size(state);
+   nir_def *centre[2][2], *frac[2];
+   for (unsigned c = 0; c < 2; c++) {
+      nir_def *size = nir_fmul_imm(b, nir_channel(b, image_size, c),
+                                   1.0 / format_plane->denominator_scales[c]);
+      nir_def *t = nir_fadd_imm(b, nir_fmul(b, nir_channel(b, coord, c), size),
+                                -0.5);
+      nir_def *i0 = nir_ffloor(b, t);
+      frac[c] = nir_fsub(b, t, i0);
+      centre[c][0] = nir_fdiv(b, nir_fadd_imm(b, i0, 0.5), size);
+      centre[c][1] = nir_fdiv(b, nir_fadd_imm(b, i0, 1.5), size);
+   }
+
+   nir_def *texel[2][2];
+   for (unsigned y = 0; y < 2; y++) {
+      for (unsigned x = 0; x < 2; x++) {
+         nir_def *comp[NIR_MAX_VEC_COMPONENTS];
+         for (unsigned c = 0; c < coord->num_components; c++)
+            comp[c] = nir_channel(b, coord, c);
+         comp[0] = centre[0][x];
+         comp[1] = centre[1][y];
+         texel[y][x] = create_plane_tex_instr(
+            state, plane, nir_vec(b, comp, coord->num_components));
+      }
+   }
+
+   nir_def *row0 = nir_flrp(b, texel[0][0], texel[0][1], frac[0]);
+   nir_def *row1 = nir_flrp(b, texel[1][0], texel[1][1], frac[0]);
+   return nir_flrp(b, row0, row1, frac[1]);
+}
+
 static unsigned
 swizzle_to_component(VkComponentSwizzle swizzle)
 {
@@ -250,6 +324,9 @@ swizzle_to_component(VkComponentSwizzle swizzle)
 struct lower_ycbcr_tex_state {
    nir_vk_ycbcr_conversion_lookup_cb cb;
    const void *cb_data;
+   bool explicit_linear_chroma;
+   bool (*explicit_linear_luma)(const void *data, uint32_t set,
+                                uint32_t binding, uint32_t array_index);
 };
 
 static bool
@@ -267,14 +344,15 @@ lower_ycbcr_tex_instr(nir_builder *b, nir_tex_instr *tex, void *_state)
 
    nir_tex_src tex_handle;
    const struct vk_ycbcr_conversion_state *conversion;
+   uint32_t lookup_set, lookup_binding, lookup_index = 0;
    if (tex->embedded_sampler) {
       const int heap_src_idx =
          nir_tex_instr_src_index(tex, nir_tex_src_texture_heap_offset);
       tex_handle = tex->src[heap_src_idx];
 
-      conversion = state->cb(state->cb_data,
-                             VK_NIR_YCBCR_SET_IMMUTABLE_SAMPLERS,
-                             tex->sampler_index, 0);
+      lookup_set = VK_NIR_YCBCR_SET_IMMUTABLE_SAMPLERS;
+      lookup_binding = tex->sampler_index;
+      conversion = state->cb(state->cb_data, lookup_set, lookup_binding, 0);
    } else {
       const int deref_src_idx =
          nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
@@ -296,6 +374,9 @@ lower_ycbcr_tex_instr(nir_builder *b, nir_tex_instr *tex, void *_state)
          array_index = nir_src_as_uint(deref->arr.index);
       }
 
+      lookup_set = set;
+      lookup_binding = binding;
+      lookup_index = array_index;
       conversion = state->cb(state->cb_data, set, binding, array_index);
    }
    if (conversion == NULL)
@@ -348,7 +429,17 @@ lower_ycbcr_tex_instr(nir_builder *b, nir_tex_instr *tex, void *_state)
          .conversion = conversion,
          .format_ycbcr_info = format_ycbcr_info,
       };
-      nir_def *plane_sample = create_plane_tex_instr_implicit(&tex_state, p);
+      const bool explicit_linear =
+         can_filter_explicitly(tex) &&
+         (format_plane->has_chroma
+             ? state->explicit_linear_chroma &&
+                  conversion->chroma_filter == VK_FILTER_LINEAR
+             : state->explicit_linear_luma &&
+                  state->explicit_linear_luma(state->cb_data, lookup_set,
+                                              lookup_binding, lookup_index));
+      nir_def *plane_sample =
+         explicit_linear ? create_plane_tex_explicit_linear(&tex_state, p)
+                         : create_plane_tex_instr_implicit(&tex_state, p);
 
       for (uint32_t pc = 0; pc < 4; pc++) {
          VkComponentSwizzle ycbcr_swizzle = format_plane->ycbcr_swizzle[pc];
@@ -409,9 +500,19 @@ bool nir_vk_lower_ycbcr_tex(nir_shader *nir,
                             nir_vk_ycbcr_conversion_lookup_cb cb,
                             const void *cb_data)
 {
+   return nir_vk_lower_ycbcr_tex_opts(nir, cb, cb_data, NULL);
+}
+
+bool nir_vk_lower_ycbcr_tex_opts(nir_shader *nir,
+                                 nir_vk_ycbcr_conversion_lookup_cb cb,
+                                 const void *cb_data,
+                                 const struct nir_vk_lower_ycbcr_tex_options *opts)
+{
    struct lower_ycbcr_tex_state state = {
       .cb = cb,
       .cb_data = cb_data,
+      .explicit_linear_chroma = opts && opts->explicit_linear_chroma,
+      .explicit_linear_luma = opts ? opts->explicit_linear_luma : NULL,
    };
 
    return nir_shader_tex_pass(nir, lower_ycbcr_tex_instr,

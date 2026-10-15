@@ -54,6 +54,27 @@ bool nir_vk_lower_ycbcr_tex(nir_shader *nir,
                             nir_vk_ycbcr_conversion_lookup_cb cb,
                             const void *cb_data);
 
+struct nir_vk_lower_ycbcr_tex_options {
+   /* Filter LINEAR chroma planes in the shader (four texel-centre samples
+    * and fp32 weights) instead of relying on the hardware bilinear weights,
+    * for hardware whose weight quantization is not the separable one the
+    * spec's subTexelPrecisionBits describes.
+    */
+   bool explicit_linear_chroma;
+
+   /* Optional: also filter the luma plane in the shader when this returns
+    * true for the sampler (both min and mag filters LINEAR). Same arguments
+    * as the conversion lookup.
+    */
+   bool (*explicit_linear_luma)(const void *data, uint32_t set,
+                                uint32_t binding, uint32_t array_index);
+};
+
+bool nir_vk_lower_ycbcr_tex_opts(nir_shader *nir,
+                                 nir_vk_ycbcr_conversion_lookup_cb cb,
+                                 const void *cb_data,
+                                 const struct nir_vk_lower_ycbcr_tex_options *opts);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

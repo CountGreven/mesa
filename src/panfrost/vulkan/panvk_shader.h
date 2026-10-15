@@ -157,6 +157,7 @@ struct panvk_graphics_sysvals {
       int32_t first_vertex;
       int32_t base_instance;
       uint32_t noperspective_varyings;
+      uint32_t draw_id;
    } vs;
 
    struct {

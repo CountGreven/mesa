@@ -314,7 +314,7 @@ panvk_per_arch(get_physical_device_features)(
       .sampleRateShading = true,
       .dualSrcBlend = true,
       .logicOp = true,
-      .multiDrawIndirect = PAN_ARCH >= 10,
+      .multiDrawIndirect = true,
       .drawIndirectFirstInstance = true,
       .depthClamp = true,
       .depthBiasClamp = true,
@@ -346,7 +346,9 @@ panvk_per_arch(get_physical_device_features)(
       .shaderSampledImageArrayDynamicIndexing = true,
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
-      .shaderClipDistance = false,
+      /* Emulated: the fragment shader discards where a distance is negative
+       * (nir_lower_clip_fs in compile_shaders). */
+      .shaderClipDistance = PAN_ARCH <= 7,
       .shaderCullDistance = false,
       .shaderFloat64 = false,
       .shaderInt64 = true,
@@ -973,7 +975,7 @@ panvk_per_arch(get_physical_device_properties)(
       .mipmapPrecisionBits = 8,
       /* Software limit. */
       .maxDrawIndexedIndexValue = UINT32_MAX,
-      .maxDrawIndirectCount = PAN_ARCH >= 10 ? UINT32_MAX : 1,
+      .maxDrawIndirectCount = UINT32_MAX,
       .maxSamplerLodBias = (float)INT16_MAX / 256.0f,
       .maxSamplerAnisotropy = 16,
       .maxViewports = 1,
@@ -1014,9 +1016,9 @@ panvk_per_arch(get_physical_device_properties)(
          PAN_ARCH >= 10 && device->kmod.dev->props.gpu_can_query_timestamp,
       .timestampPeriod =
          PAN_ARCH >= 10 ? panvk_get_gpu_system_timestamp_period(device) : 0,
-      .maxClipDistances = 0,
+      .maxClipDistances = PAN_ARCH <= 7 ? 8 : 0,
       .maxCullDistances = 0,
-      .maxCombinedClipAndCullDistances = 0,
+      .maxCombinedClipAndCullDistances = PAN_ARCH <= 7 ? 8 : 0,
       .discreteQueuePriorities = 2,
       .pointSizeRange = {pointSizeRangeMin, pointSizeRangeMax},
       .lineWidthRange = {0.0, 7.9921875},
