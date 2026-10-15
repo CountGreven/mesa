@@ -649,7 +649,9 @@ panvk_draw_prepare_vs_attribs(struct panvk_cmd_buffer *cmdbuf,
          cmdbuf, desc,
          num_vs_attribs * sizeof(struct libpan_draw_helper_attrib_info), 8);
 
-      if (!bufs_infos_storage.gpu ||
+      /* Zero-sized allocations return NULL: a draw without vertex buffers
+       * (vertex pulling) is not out of memory. */
+      if ((num_vbs && !bufs_infos_storage.gpu) ||
           (num_vs_attribs && !attribs_infos_storage.gpu))
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
@@ -705,16 +707,20 @@ panvk_draw_prepare_vs_attribs(struct panvk_cmd_buffer *cmdbuf,
    return VK_SUCCESS;
 }
 
-static void
+static VkResult
 panvk_draw_prepare_attributes(struct panvk_cmd_buffer *cmdbuf,
                               struct panvk_draw_data *draw)
 {
-   panvk_draw_prepare_vs_attribs(cmdbuf, draw);
+   VkResult result = panvk_draw_prepare_vs_attribs(cmdbuf, draw);
+   if (result != VK_SUCCESS)
+      return result;
+
    draw->vs.attributes = cmdbuf->state.gfx.vs.attribs;
    draw->vs.attribute_bufs = cmdbuf->state.gfx.vs.attrib_bufs;
    draw->indirect_info.attribs = cmdbuf->state.gfx.vs.indirect_attribs_infos;
    draw->indirect_info.attrib_bufs =
       cmdbuf->state.gfx.vs.indirect_attrib_bufs_infos;
+   return VK_SUCCESS;
 }
 
 static void
@@ -1321,7 +1327,9 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
    /* This allocates and initializes the image table, which we need before we
     * can copy descriptors.
     */
-   panvk_draw_prepare_attributes(cmdbuf, draw);
+   result = panvk_draw_prepare_attributes(cmdbuf, draw);
+   if (result != VK_SUCCESS)
+      return result;
 
    if (gfx_state_dirty(cmdbuf, DESC_STATE) || gfx_state_dirty(cmdbuf, VS)) {
       result = panvk_draw_prepare_vs_copy_desc_job(cmdbuf, draw);
