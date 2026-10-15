@@ -2218,7 +2218,14 @@ emit_image_bufs(struct panfrost_batch *batch, mesa_shader_stage shader,
                                        : rsrc->plane.layout.array_stride_B;
 
          cfg.s_dimension = u_minify(rsrc->base.width0, level);
-         cfg.t_dimension = u_minify(rsrc->base.height0, level);
+         /* An MTK tiled import is laid out as a linear image of one tile
+          * per row, much taller than the picture: bound the rows by the
+          * layout, or the detile reads below height0 return zero. */
+         cfg.t_dimension =
+            u_minify(drm_is_mtk_tiled(rsrc->modifier)
+                        ? rsrc->image.props.extent_px.height
+                        : rsrc->base.height0,
+                     level);
          cfg.r_dimension =
             is_3d ? u_minify(rsrc->image.props.extent_px.depth, level)
                   : (image->u.tex.last_layer - image->u.tex.first_layer + 1);
