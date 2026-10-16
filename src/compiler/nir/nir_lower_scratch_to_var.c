@@ -48,7 +48,10 @@ mem_access_cb(nir_intrinsic_op intrin, uint8_t bytes, uint8_t bit_size,
 
 /*
  * Thanks to nir_lower_mem_access_bit_sizes, we can lower scratch intrinsics 1:1
- * to word-based array access.
+ * to word-based array access. Scratch offsets are 32-bit, but the address may
+ * come in wider (a generic pointer after nir_lower_explicit_io): the division
+ * is done on 32 bits, as a backend that lowered int64 earlier cannot take a
+ * 64-bit one.
  */
 static bool
 lower_scratch_to_var(nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -57,13 +60,13 @@ lower_scratch_to_var(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    b->cursor = nir_before_instr(&intr->instr);
 
    if (intr->intrinsic == nir_intrinsic_store_scratch) {
-      nir_def *index = nir_udiv_aligned_4(b, intr->src[1].ssa);
+      nir_def *index = nir_udiv_aligned_4(b, nir_u2u32(b, intr->src[1].ssa));
       nir_def *value = intr->src[0].ssa;
 
       index = nir_u2uN(b, index, nir_get_ptr_bitsize(b->shader));
       nir_store_array_var(b, scratch, index, value, nir_component_mask(1));
    } else if (intr->intrinsic == nir_intrinsic_load_scratch) {
-      nir_def *index = nir_udiv_aligned_4(b, intr->src[0].ssa);
+      nir_def *index = nir_udiv_aligned_4(b, nir_u2u32(b, intr->src[0].ssa));
 
       index = nir_u2uN(b, index, nir_get_ptr_bitsize(b->shader));
       nir_def_rewrite_uses(&intr->def, nir_load_array_var(b, scratch, index));
