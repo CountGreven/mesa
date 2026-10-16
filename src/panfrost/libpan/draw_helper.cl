@@ -680,6 +680,66 @@ panlib_draw_indexed_gs_helper(
    *gs_instance_stride = instance_count > 1 ? draw.padded_vertex_count : 0;
 }
 
+/* panlib_draw_indexed_gs_helper for an indirect draw without indices: the vertex range is the
+ * command's. */
+KERNEL(1)
+panlib_draw_gs_helper(
+   global VkDrawIndirectCommand *cmd, global struct poly_heap *heap,
+   global struct mali_attribute_buffer_packed *varying_bufs_descs,
+   global struct mali_attribute_buffer_packed *attrib_bufs_descs,
+   global struct libpan_draw_helper_attrib_buf_info *attrib_bufs_infos,
+   global struct mali_attribute_packed *attribs_descs,
+   global struct libpan_draw_helper_attrib_info *attribs_infos,
+   global uint32_t *first_vertex_sysval, global uint32_t *first_instance_sysval,
+   global uint32_t *raw_vertex_offset_sysval, global uint8_t *vertex_job,
+   global uint64_t *gs_in_bufs, global uint32_t *gs_index_bias,
+   global uint32_t *gs_instance_stride, uint32_t attrib_bufs_valid,
+   uint32_t attribs_valid, uint32_t writes_psiz)
+{
+   const uint32_t vertex_count = cmd->vertexCount;
+   const uint32_t instance_count = cmd->instanceCount;
+
+   struct panlib_draw_info draw = {
+      .vertex_job = vertex_job,
+
+      .vertex.base = cmd->firstVertex,
+      .vertex.raw_offset = cmd->firstVertex,
+      .vertex.count = vertex_count,
+      .instance.base = cmd->firstInstance,
+      .instance.count = instance_count,
+
+      .varying_bufs.descs = varying_bufs_descs,
+
+      .attrib_bufs.descs = attrib_bufs_descs,
+      .attrib_bufs.infos = attrib_bufs_infos,
+      .attrib_bufs.valid = attrib_bufs_valid,
+
+      .attribs.descs = attribs_descs,
+      .attribs.infos = attribs_infos,
+      .attribs.valid = attribs_valid,
+
+      .vertex_range = vertex_count,
+      .padded_vertex_count = padded_vertex_count(vertex_count, instance_count, false),
+      .primitive_vertex_count = 1,
+
+      .heap = heap,
+   };
+
+   panlib_patch_draw(&draw);
+
+   *first_vertex_sysval = draw.vertex.base;
+   *first_instance_sysval = draw.instance.base;
+   *raw_vertex_offset_sysval = draw.vertex.raw_offset;
+
+   pan_unpack(&varying_bufs_descs[PANLIB_VARY_BUF_GENERAL], ATTRIBUTE_BUFFER,
+              general);
+   gs_in_bufs[0] = draw.position;
+   gs_in_bufs[1] = writes_psiz ? draw.psiz : 0;
+   gs_in_bufs[2] = general.pointer;
+   *gs_index_bias = 0;
+   *gs_instance_stride = instance_count > 1 ? draw.padded_vertex_count : 0;
+}
+
 /* A multi-draw: one invocation per draw of a vkCmdDrawIndexedIndirect, so the
  * whole call needs one helper job instead of one per draw (each with its own
  * prefetch barrier). */
