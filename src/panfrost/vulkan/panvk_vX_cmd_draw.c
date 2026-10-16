@@ -811,6 +811,15 @@ prepare_iam_sysvals(struct panvk_cmd_buffer *cmdbuf, BITSET_WORD *dirty_sysvals)
             : vk_format_is_sint(fmt) ? MALI_REGISTER_FILE_FORMAT_I32
                                      : MALI_REGISTER_FILE_FORMAT_F32;
 #endif
+#if PAN_ARCH == 6
+         /* v6 keeps an RGBA swizzle for alpha-less formats (fixed-function
+          * blending needs four components), so a tile read of R5G6B5 returns
+          * alpha 0. Input attachments must read alpha 1.
+          */
+         if (!util_format_has_alpha(pfmt))
+            cfg.memory_format = (cfg.memory_format & ~(7u << 9)) |
+                                (MALI_CHANNEL_1 << 9);
+#endif
       }
 
       iam[ia_idx].conversion = conv.opaque[0];
