@@ -192,6 +192,15 @@ struct panvk_cmd_graphics_state {
       /* Rebuilt when VS, GS or FS changes. */
       struct panvk_gs_link link;
    } gs;
+
+   /* Tessellation (pan_gs.h): the tess eval shader runs as a geometry
+    * shader, with its own descriptor state; the tess control one as a
+    * compute job.
+    */
+   struct {
+      const struct panvk_shader *tcs, *tes;
+      struct panvk_shader_desc_state tcs_desc, tes_desc;
+   } tess;
 #endif
 
    struct {

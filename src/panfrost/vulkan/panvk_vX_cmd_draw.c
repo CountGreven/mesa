@@ -884,6 +884,8 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
                   info->vertex.raw_offset);
    set_gfx_sysval(cmdbuf, dirty_sysvals, vs.draw_id, info->draw_id);
    set_gfx_sysval(cmdbuf, dirty_sysvals, layer_id, info->layer_id);
+   set_gfx_sysval(cmdbuf, dirty_sysvals, fs_prim_id_varying,
+                  cmdbuf->state.gfx.gs.shader || cmdbuf->state.gfx.tess.tes);
 #endif
 
    if (dyn_gfx_state_dirty(cmdbuf, CB_BLEND_CONSTANTS)) {
@@ -999,6 +1001,10 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
       used_set_mask |= cmdbuf->state.gfx.fs.shader->desc_info.used_set_mask;
    if (cmdbuf->state.gfx.gs.shader)
       used_set_mask |= cmdbuf->state.gfx.gs.shader->desc_info.used_set_mask;
+   if (cmdbuf->state.gfx.tess.tcs)
+      used_set_mask |= cmdbuf->state.gfx.tess.tcs->desc_info.used_set_mask;
+   if (cmdbuf->state.gfx.tess.tes)
+      used_set_mask |= cmdbuf->state.gfx.tess.tes->desc_info.used_set_mask;
 
    for (uint32_t i = 0; i < MAX_SETS; i++) {
       if (used_set_mask & BITFIELD_BIT(i)) {

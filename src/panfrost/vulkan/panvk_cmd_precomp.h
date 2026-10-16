@@ -20,6 +20,8 @@ struct panvk_cmd_buffer;
 
 struct panvk_precomp_ctx {
    struct panvk_cmd_buffer *cmdbuf;
+   /* JM: the job the last dispatch added, for a job that patches its size. */
+   uint64_t last_job;
 };
 
 static inline struct panvk_precomp_ctx

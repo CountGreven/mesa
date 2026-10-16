@@ -310,7 +310,7 @@ panvk_per_arch(get_physical_device_features)(
       .imageCubeArray = true,
       .independentBlend = true,
       .geometryShader = PAN_ARCH <= 7,
-      .tessellationShader = false,
+      .tessellationShader = PAN_ARCH <= 7,
       .sampleRateShading = true,
       .dualSrcBlend = true,
       .logicOp = true,
@@ -931,14 +931,14 @@ panvk_per_arch(get_physical_device_properties)(
       /* 32 vec4 varyings. */
       .maxVertexOutputComponents = 128,
       /* Tesselation shaders not supported. */
-      .maxTessellationGenerationLevel = 0,
-      .maxTessellationPatchSize = 0,
-      .maxTessellationControlPerVertexInputComponents = 0,
-      .maxTessellationControlPerVertexOutputComponents = 0,
-      .maxTessellationControlPerPatchOutputComponents = 0,
-      .maxTessellationControlTotalOutputComponents = 0,
-      .maxTessellationEvaluationInputComponents = 0,
-      .maxTessellationEvaluationOutputComponents = 0,
+      .maxTessellationGenerationLevel = PAN_ARCH <= 7 ? 64 : 0,
+      .maxTessellationPatchSize = PAN_ARCH <= 7 ? 32 : 0,
+      .maxTessellationControlPerVertexInputComponents = PAN_ARCH <= 7 ? 64 : 0,
+      .maxTessellationControlPerVertexOutputComponents = PAN_ARCH <= 7 ? 64 : 0,
+      .maxTessellationControlPerPatchOutputComponents = PAN_ARCH <= 7 ? 120 : 0,
+      .maxTessellationControlTotalOutputComponents = PAN_ARCH <= 7 ? 2048 : 0,
+      .maxTessellationEvaluationInputComponents = PAN_ARCH <= 7 ? 64 : 0,
+      .maxTessellationEvaluationOutputComponents = PAN_ARCH <= 7 ? 64 : 0,
       /* Geometry shaders not supported. */
       /* Geometry shaders are emulated on JM (pan_gs.h): the Vulkan minimums. */
       .maxGeometryShaderInvocations = PAN_ARCH <= 7 ? 32 : 0,

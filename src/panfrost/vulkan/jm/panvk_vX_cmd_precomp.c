@@ -80,6 +80,7 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
    }
 
    util_dynarray_append(&batch->jobs, job.cpu);
+   ctx->last_job = job.gpu;
 
    bool job_barrier = (barrier & PANLIB_BARRIER_JM_BARRIER) != 0;
    bool suppress_prefetch =

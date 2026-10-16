@@ -217,6 +217,8 @@ libvulkan_panfrost = shared_library(
     libpanfrost_decode,
     libpanfrost_lib,
     libpanfrost_compiler,
+    # Tessellation on JM (poly_nir_lower_tcs/tes, see pan_gs.h)
+    libpoly_nir,
   ],
   dependencies : [
     dep_dl,

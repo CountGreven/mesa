@@ -267,6 +267,8 @@ shader_ssbo_table(nir_builder *b, unsigned set, unsigned binding,
     * uniforms, so it can reuse the vertex shader's table slot.
     */
    case MESA_SHADER_GEOMETRY:
+   case MESA_SHADER_TESS_CTRL:
+   case MESA_SHADER_TESS_EVAL:
       return PANVK_DESC_TABLE_VS_DYN_SSBOS;
    case MESA_SHADER_FRAGMENT:
       return PANVK_DESC_TABLE_FS_DYN_SSBOS;

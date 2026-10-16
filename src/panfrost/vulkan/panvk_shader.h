@@ -173,6 +173,12 @@ struct panvk_graphics_sysvals {
     */
    int32_t layer_id;
 
+   /* Non-zero when the geometry shader emulation draws: the fragment shader
+    * reads gl_PrimitiveID from the emulation's records (PAN_GS_PRIMID_SLOT)
+    * instead of the hardware's primitive index.
+    */
+   uint32_t fs_prim_id_varying;
+
    struct {
       aligned_u64 sets[PANVK_DESC_TABLE_GFX_COUNT];
    } desc;
@@ -457,14 +463,38 @@ enum panvk_vs_variant {
    PANVK_VS_VARIANTS,
 };
 
+#if PAN_ARCH < 9
+/* The tess eval shader runs as a geometry shader emulation (pan_gs.h), whose
+ * outputs go to the tiler or, before a geometry shader, to its inputs.
+ */
+enum panvk_tes_variant {
+   PANVK_TES_VARIANT_FS,
+   PANVK_TES_VARIANT_GS,
+   PANVK_TES_VARIANTS,
+};
+#endif
+
 struct panvk_shader {
    struct vk_shader vk;
 
    struct panvk_shader_desc_info desc_info;
 
 #if PAN_ARCH < 9
-   /* Geometry shaders: what the draw path needs to run the emulation. */
+   /* Geometry shaders, and tess eval shaders run as one: what the draw path
+    * needs to run the emulation.
+    */
    struct pan_gs_info gs;
+
+   /* Tess control and tess eval shaders (pan_gs.h). */
+   struct {
+      uint8_t prim;       /* enum tess_primitive_mode */
+      uint8_t spacing;    /* enum gl_tess_spacing */
+      bool ccw, point_mode;
+      uint16_t tcs_vertices_out;
+      uint16_t tcs_patch_constants;
+      uint32_t tcs_stride_el;
+      uint64_t tcs_per_vertex_outputs;
+   } tess;
 #endif
 
    struct panvk_shader_variant variants[];
@@ -475,6 +505,10 @@ panvk_shader_num_variants(mesa_shader_stage stage)
 {
    if (stage == MESA_SHADER_VERTEX)
       return PANVK_VS_VARIANTS;
+#if PAN_ARCH < 9
+   if (stage == MESA_SHADER_TESS_EVAL)
+      return PANVK_TES_VARIANTS;
+#endif
 
    return 1;
 }
@@ -497,6 +531,10 @@ panvk_shader_variant_name(const struct panvk_shader *shader,
       assert(i < ARRAY_SIZE(panvk_vs_shader_variant_name));
       return panvk_vs_shader_variant_name[i];
    }
+#if PAN_ARCH < 9
+   if (shader->vk.stage == MESA_SHADER_TESS_EVAL)
+      return i == PANVK_TES_VARIANT_GS ? "geometry input" : NULL;
+#endif
 
    assert(panvk_shader_num_variants(shader->vk.stage) == 1);
 
