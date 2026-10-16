@@ -12,6 +12,9 @@
 
 #include "drm-uapi/panthor_drm.h"
 
+#include <fcntl.h>
+#include <xf86drm.h>
+
 #include "vk_cmd_enqueue_entrypoints.h"
 #include "vk_common_entrypoints.h"
 #include "vk_drm_syncobj.h"
@@ -119,6 +122,27 @@ panvk_device_cleanup_mempools(struct panvk_device *dev)
  * support alloc-on-fault, so we initialize the heap the first time it is used
  * in a command buffer to avoid wasting memory on the heap buffer on
  * applications that don't use it */
+/* On JM the GPU address space belongs to the DRM file, so devices created on
+ * a dup of the physical device fd share 4GB of VA, and each one reserves
+ * 128MB tiler and poly heaps: device creation runs out of VA after ~15
+ * devices. Give every device its own file there.
+ */
+static int
+panvk_open_device_fd(const struct panvk_physical_device *phys_dev)
+{
+#if PAN_ARCH < 10
+   char *name = drmGetRenderDeviceNameFromFd(phys_dev->kmod.dev->fd);
+   if (name) {
+      int fd = open(name, O_RDWR | O_CLOEXEC);
+      free(name);
+      if (fd >= 0)
+         return fd;
+   }
+#endif
+
+   return os_dupfd_cloexec(phys_dev->kmod.dev->fd);
+}
+
 static VkResult
 panvk_device_init_poly_heap_inner(struct panvk_device *dev)
 {
@@ -516,7 +540,7 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       .priv = &device->vk.alloc,
    };
    device->kmod.dev = pan_kmod_dev_create(
-      os_dupfd_cloexec(physical_device->kmod.dev->fd),
+      panvk_open_device_fd(physical_device),
       physical_device->kmod.dev->flags, &device->kmod.allocator);
 
    if (!device->kmod.dev) {
