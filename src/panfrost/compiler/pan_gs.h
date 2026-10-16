@@ -19,12 +19,13 @@
  * degenerate, so the tiler job's counts are known when the draw is recorded.
  */
 
-#include <stdbool.h>
-#include <stdint.h>
-
+/* The parameter block is shared with the libpan kernels (tess.cl). */
+#include "compiler/libcl/libcl.h"
 #include "compiler/shader_enums.h"
 
+#ifndef __OPENCL_VERSION__
 struct nir_shader;
+#endif
 
 #define PAN_GS_WORKGROUP_SIZE 64
 #define PAN_GS_SLOT_UNUSED    0xffffffffu
@@ -98,6 +99,8 @@ struct pan_gs_params {
     * primitive goes to the region of its gl_Layer, and every other region keeps dead slots. */
    uint32_t layer_count;
    uint32_t layer_stride;
+   /* Tessellation: the draw's struct poly_tess_params (load_tess_param_buffer_poly). */
+   uint64_t tess_params;
 };
 
 #define PAN_GS_MAX_VIEWPORTS 16
@@ -108,6 +111,10 @@ struct pan_gs_params {
  * generic. The fragment shader's reads are moved to them (panfrost_shader_compile). */
 #define PAN_GS_VIEWPORT_SLOT VARYING_SLOT_CULL_DIST0
 #define PAN_GS_LAYER_SLOT    VARYING_SLOT_CULL_DIST1
+/* gl_PrimitiveID on its way to the fragment shader, which reads it from here when the
+ * emulation draws (the hardware's primitive index counts the emulation's primitives). A slot
+ * neither SPIR-V nor GLSL ES uses. */
+#define PAN_GS_PRIMID_SLOT   VARYING_SLOT_TEX0
 /* The clip-space position, kept for transform feedback (the tiler's buffer has it in screen
  * space, snapped). A slot no GLSL ES shader writes. */
 #define PAN_GS_XFB_POS_SLOT  VARYING_SLOT_CLIP_VERTEX
@@ -134,7 +141,9 @@ struct pan_gs_info {
    uint8_t cull_count;
 };
 
+#ifndef __OPENCL_VERSION__
 void pan_gs_gather_info(const struct nir_shader *nir, struct pan_gs_info *info);
+#endif
 
 /* Byte offset of an output slot in the generic record, PAN_GS_SLOT_UNUSED if none. */
 static inline uint32_t
@@ -154,12 +163,19 @@ pan_gs_out_offset(const struct pan_gs_info *info, unsigned slot)
  * point-out geometry shader run once per tessellator index, whose identity index buffer the
  * tiler draws with the tessellated primitive type.
  */
+#ifndef __OPENCL_VERSION__
 bool pan_nir_lower_tcs_inputs(struct nir_shader *nir);
 void pan_nir_tes_to_gs(struct nir_shader *nir);
+/* load_tess_param_buffer_poly from pan_gs_params::tess_params, after the poly lowerings. */
+bool pan_nir_lower_tess_params(struct nir_shader *nir);
 
 /* Lowers a geometry shader (gallium lowered IO) into the compute shader described above.
- * noperspective: output slots VAR0 + i the fragment shader interpolates without perspective. */
+ * noperspective: output slots VAR0 + i the fragment shader interpolates without perspective.
+ * gs_input: the outputs feed another geometry shader instead of the tiler (a tess eval shader
+ * before one): positions stay in clip space and every output is stored as written, the layout
+ * the next stage reads through pan_gs_params::in_offsets. */
 bool pan_nir_lower_gs(struct nir_shader *nir, const struct pan_gs_info *info,
-                      uint32_t noperspective);
+                      uint32_t noperspective, bool gs_input);
+#endif
 
 #endif /* PAN_GS_H */

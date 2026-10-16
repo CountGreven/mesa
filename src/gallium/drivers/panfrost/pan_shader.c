@@ -113,7 +113,7 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
    if (s->info.stage == MESA_SHADER_GEOMETRY) {
       struct pan_gs_info gs;
       pan_gs_gather_info(s, &gs);
-      NIR_PASS(_, s, pan_nir_lower_gs, &gs, key->gs.noperspective_varyings);
+      NIR_PASS(_, s, pan_nir_lower_gs, &gs, key->gs.noperspective_varyings, false);
    }
 
    /* While graphics shaders are preprocessed at CSO create time, compute

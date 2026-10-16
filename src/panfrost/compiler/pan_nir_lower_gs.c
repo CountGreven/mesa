@@ -44,17 +44,19 @@ pan_gs_gather_info(const nir_shader *nir, struct pan_gs_info *info)
    info->writes_viewport = written & VARYING_BIT_VIEWPORT;
 
    /* Everything the fragment shader may read as an ordinary varying. Position and point size
-    * have buffers of their own, gl_ViewportIndex and gl_Layer travel in slots of their own
-    * (PAN_GS_VIEWPORT_SLOT), and the primitive ID has no path to the fragment shader here. */
+    * have buffers of their own, gl_ViewportIndex, gl_Layer and gl_PrimitiveID travel in slots of
+    * their own (PAN_GS_VIEWPORT_SLOT). */
    info->generic_mask =
       written & ~(VARYING_BIT_POS | VARYING_BIT_PSIZ | VARYING_BIT_PRIMITIVE_ID |
                   VARYING_BIT_EDGE | VARYING_BIT_CLIP_VERTEX | VARYING_BIT_VIEWPORT |
                   VARYING_BIT_LAYER | BITFIELD64_BIT(PAN_GS_VIEWPORT_SLOT) |
-                  BITFIELD64_BIT(PAN_GS_LAYER_SLOT));
+                  BITFIELD64_BIT(PAN_GS_LAYER_SLOT) | BITFIELD64_BIT(PAN_GS_PRIMID_SLOT));
    if (written & VARYING_BIT_VIEWPORT)
       info->generic_mask |= BITFIELD64_BIT(PAN_GS_VIEWPORT_SLOT);
    if (written & VARYING_BIT_LAYER)
       info->generic_mask |= BITFIELD64_BIT(PAN_GS_LAYER_SLOT);
+   if (written & VARYING_BIT_PRIMITIVE_ID)
+      info->generic_mask |= BITFIELD64_BIT(PAN_GS_PRIMID_SLOT);
    if (nir->xfb_info) {
       for (unsigned i = 0; i < nir->xfb_info->output_count; i++) {
          if (nir->xfb_info->outputs[i].location == VARYING_SLOT_POS)
@@ -95,6 +97,7 @@ load_components(nir_builder *b, nir_def *base, nir_def *byte_off, unsigned num_c
 struct lower_gs_state {
    const struct pan_gs_info *info;
    uint32_t noperspective;
+   bool gs_input;
 
    nir_def *params;
    nir_def *in_pos, *in_psiz, *in_general, *in_offsets, *in_general_stride;
@@ -410,7 +413,7 @@ lower_emit_vertex(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_sta
          vp_offset = nir_load_viewport_offset(b);
       }
       store_components(b, st->out_pos, nir_imul_imm(b, slot, 16),
-                       clip_to_screen(b, clip, vp_scale, vp_offset));
+                       st->gs_input ? clip : clip_to_screen(b, clip, vp_scale, vp_offset));
 
       if (info->writes_psiz && st->outputs[VARYING_SLOT_PSIZ]) {
          nir_def *psiz = nir_channel(b, nir_load_var(b, st->outputs[VARYING_SLOT_PSIZ]), 0);
@@ -425,6 +428,7 @@ lower_emit_vertex(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_sta
       u_foreach_bit64(loc, info->generic_mask) {
          nir_variable *var = loc == PAN_GS_VIEWPORT_SLOT ? st->outputs[VARYING_SLOT_VIEWPORT]
                              : loc == PAN_GS_LAYER_SLOT  ? st->outputs[VARYING_SLOT_LAYER]
+                             : loc == PAN_GS_PRIMID_SLOT ? st->outputs[VARYING_SLOT_PRIMITIVE_ID]
                              : loc == PAN_GS_XFB_POS_SLOT ? st->outputs[VARYING_SLOT_POS]
                                                           : st->outputs[loc];
          if (!var)
@@ -434,7 +438,7 @@ lower_emit_vertex(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_sta
 
          /* Cull distances become markers, see panfrost_lower_cull_vs. */
          if ((loc == VARYING_SLOT_CLIP_DIST0 || loc == VARYING_SLOT_CLIP_DIST1) &&
-             info->cull_count) {
+             info->cull_count && !st->gs_input) {
             nir_def *c[4];
             for (unsigned k = 0; k < 4; k++) {
                const unsigned idx = (loc - VARYING_SLOT_CLIP_DIST0) * 4 + k;
@@ -605,7 +609,8 @@ lower_gs_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 }
 
 bool
-pan_nir_lower_gs(nir_shader *nir, const struct pan_gs_info *info, uint32_t noperspective)
+pan_nir_lower_gs(nir_shader *nir, const struct pan_gs_info *info, uint32_t noperspective,
+                 bool gs_input)
 {
    assert(nir->info.stage == MESA_SHADER_GEOMETRY);
 
@@ -629,10 +634,15 @@ pan_nir_lower_gs(nir_shader *nir, const struct pan_gs_info *info, uint32_t noper
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    nir_builder b = nir_builder_at(nir_before_impl(impl));
 
-   struct lower_gs_state st = {.info = info, .noperspective = noperspective};
+   struct lower_gs_state st = {
+      .info = info,
+      .noperspective = gs_input ? 0 : noperspective,
+      .gs_input = gs_input,
+   };
 
    u_foreach_bit64(loc, info->generic_mask | VARYING_BIT_POS | VARYING_BIT_PSIZ |
-                           VARYING_BIT_VIEWPORT | VARYING_BIT_LAYER) {
+                           VARYING_BIT_VIEWPORT | VARYING_BIT_LAYER |
+                           VARYING_BIT_PRIMITIVE_ID) {
       if (loc < 64 && (nir->info.outputs_written & BITFIELD64_BIT(loc)))
          st.outputs[loc] = nir_local_variable_create(impl, glsl_uvec4_type(), "gs_out");
    }
@@ -685,7 +695,7 @@ pan_nir_lower_gs(nir_shader *nir, const struct pan_gs_info *info, uint32_t noper
    nir_push_if(&b, nir_ine_imm(&b, count_addr, 0));
    nir_def *counted = nir_load_global(&b, 1, 32, count_addr, .align_mul = 4);
    nir_pop_if(&b, NULL);
-   nir_def *actual = nir_if_phi(&b, counted, num_prims);
+   nir_def *actual = nir_umin(&b, nir_if_phi(&b, counted, num_prims), num_prims);
    nir_push_if(&b, nir_uge(&b, prim_global, actual));
    nir_jump(&b, nir_jump_return);
    nir_pop_if(&b, NULL);
@@ -707,4 +717,115 @@ pan_nir_lower_gs(nir_shader *nir, const struct pan_gs_info *info, uint32_t noper
    NIR_PASS(_, nir, nir_opt_dce);
 
    return progress;
+}
+
+/* -- Tessellation, see pan_gs.h ------------------------------------------------------------ */
+
+static bool
+lower_tcs_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct lower_gs_state *st = data;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_per_vertex_input:
+      nir_def_replace(&intr->def, lower_per_vertex_input(b, intr, st));
+      return true;
+   case nir_intrinsic_barrier: {
+      /* The outputs become global memory (poly_nir_lower_tcs), and a patch does not fit in a
+       * Bifrost subgroup: the barrier keeps its workgroup scope and covers global memory. Done
+       * before poly sees it, which would narrow it to a subgroup. */
+      nir_variable_mode modes = nir_intrinsic_memory_modes(intr);
+      if (!(modes & nir_var_shader_out))
+         return false;
+      nir_intrinsic_set_memory_modes(intr, (modes & ~nir_var_shader_out) | nir_var_mem_global);
+      if (nir_intrinsic_execution_scope(intr) < SCOPE_WORKGROUP)
+         nir_intrinsic_set_execution_scope(intr, SCOPE_WORKGROUP);
+      if (nir_intrinsic_memory_scope(intr) < SCOPE_WORKGROUP)
+         nir_intrinsic_set_memory_scope(intr, SCOPE_WORKGROUP);
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+bool
+pan_nir_lower_tcs_inputs(nir_shader *nir)
+{
+   /* A patch is a list of pan_gs_params::patch_size records (input_verts 0). */
+   static const struct pan_gs_info tcs_info = {.input_verts = 0};
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+
+   struct lower_gs_state st = {.info = &tcs_info};
+   load_input_params(&b, &st);
+   st.topology = nir_imm_int(&b, PAN_GS_TOPO_LIST);
+   st.flatshade_first = nir_imm_int(&b, 0);
+
+   /* One workgroup per patch: x the patch within its instance, y the instance. */
+   nir_def *wg = nir_load_workgroup_id(&b);
+   st.prim_id = nir_channel(&b, wg, 0);
+   st.instance = nir_channel(&b, wg, 1);
+
+   return nir_shader_intrinsics_pass(nir, lower_tcs_instr, nir_metadata_none, &st);
+}
+
+static bool
+lower_tess_params_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_tess_param_buffer_poly)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   struct lower_gs_state st = {.params = nir_load_geometry_param_buffer_poly(b)};
+   nir_def_replace(&intr->def, PARAM64(b, &st, tess_params));
+   return true;
+}
+
+bool
+pan_nir_lower_tess_params(nir_shader *nir)
+{
+   return nir_shader_intrinsics_pass(nir, lower_tess_params_instr, nir_metadata_control_flow,
+                                     NULL);
+}
+
+static bool
+lower_tes_vertex_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_vertex_id)
+      return false;
+
+   /* poly_nir_lower_tes reads the tessellator's index buffer at the vertex ID: run as a
+    * geometry shader on points, that is the input primitive. */
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_load_primitive_id(b));
+   return true;
+}
+
+void
+pan_nir_tes_to_gs(nir_shader *nir)
+{
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_tes_vertex_id, nir_metadata_control_flow,
+            NULL);
+
+   nir->info.stage = MESA_SHADER_GEOMETRY;
+   memset(&nir->info.gs, 0, sizeof(nir->info.gs));
+   nir->info.gs.input_primitive = MESA_PRIM_POINTS;
+   nir->info.gs.output_primitive = MESA_PRIM_POINTS;
+   nir->info.gs.vertices_in = 1;
+   nir->info.gs.vertices_out = 1;
+   nir->info.gs.invocations = 1;
+   nir->info.gs.active_stream_mask = 1;
+
+   /* The outputs are copied out of their temporaries at the very end of the shader
+    * (nir_lower_io_vars_to_temporaries), so one EmitVertex after everything emits the
+    * finished vertex. */
+   NIR_PASS(_, nir, nir_lower_returns);
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   nir_emit_vertex(&b, 0);
+   nir_progress(true, impl, nir_metadata_none);
 }
