@@ -405,9 +405,12 @@ panlib_patch_draw(struct panlib_draw_info *draw)
       panlib_patch_job_type_header(
          (global struct mali_job_header_packed *)draw->vertex_job,
          is_null_job ? MALI_JOB_TYPE_NULL : MALI_JOB_TYPE_VERTEX);
-      panlib_patch_job_type_header(
-         (global struct mali_job_header_packed *)draw->tiler_job,
-         is_null_job ? MALI_JOB_TYPE_NULL : MALI_JOB_TYPE_TILER);
+      /* No tiler job with rasterizer discard or a geometry shader. */
+      if (draw->tiler_job != NULL) {
+         panlib_patch_job_type_header(
+            (global struct mali_job_header_packed *)draw->tiler_job,
+            is_null_job ? MALI_JOB_TYPE_NULL : MALI_JOB_TYPE_TILER);
+      }
    }
 
    /* In case there is nothing to draw, let's just bail out. */
@@ -602,6 +605,79 @@ panlib_draw_indexed_indirect_helper(
                          first_vertex_sysval, first_instance_sysval,
                          raw_vertex_offset_sysval, idvs_job, vertex_job,
                          tiler_job);
+}
+
+/* An indexed draw through the geometry shader emulation (pan_gs.h): the
+ * vertex job of a regular indexed draw, without a tiler job, and the emulation
+ * learns where the vertex job writes and how its records are numbered:
+ * gs_in_bufs points at pan_gs_params::in_pos, in_psiz and in_general.
+ */
+KERNEL(1)
+panlib_draw_indexed_gs_helper(
+   global VkDrawIndexedIndirectCommand *cmd, global uint8_t *index_buffer_ptr,
+   global struct libpan_draw_helper_index_min_max_result *index_min_max_res,
+   global struct poly_heap *heap,
+   global struct mali_attribute_buffer_packed *varying_bufs_descs,
+   global struct mali_attribute_buffer_packed *attrib_bufs_descs,
+   global struct libpan_draw_helper_attrib_buf_info *attrib_bufs_infos,
+   global struct mali_attribute_packed *attribs_descs,
+   global struct libpan_draw_helper_attrib_info *attribs_infos,
+   global uint32_t *first_vertex_sysval, global uint32_t *first_instance_sysval,
+   global uint32_t *raw_vertex_offset_sysval, global uint8_t *vertex_job,
+   global uint64_t *gs_in_bufs, global uint32_t *gs_index_bias,
+   global uint32_t *gs_instance_stride, uint32_t index_size,
+   uint32_t attrib_bufs_valid, uint32_t attribs_valid, uint32_t writes_psiz)
+{
+   const uint32_t instance_count = cmd->instanceCount;
+   const int32_t vertex_offset = cmd->vertexOffset;
+   const uint32_t min_vertex = index_min_max_res->min;
+   const uint32_t max_vertex = index_min_max_res->max;
+   const uint32_t vertex_range =
+      max_vertex >= min_vertex ? max_vertex - min_vertex + 1 : 0;
+
+   struct panlib_draw_info draw = {
+      .vertex_job = vertex_job,
+
+      .index.size = index_size,
+      .index.offset = cmd->firstIndex,
+      .vertex.base = vertex_offset,
+      .vertex.raw_offset = min_vertex + vertex_offset,
+      .vertex.count = cmd->indexCount,
+      .instance.base = cmd->firstInstance,
+      .instance.count = instance_count,
+
+      .varying_bufs.descs = varying_bufs_descs,
+
+      .attrib_bufs.descs = attrib_bufs_descs,
+      .attrib_bufs.infos = attrib_bufs_infos,
+      .attrib_bufs.valid = attrib_bufs_valid,
+
+      .attribs.descs = attribs_descs,
+      .attribs.infos = attribs_infos,
+      .attribs.valid = attribs_valid,
+
+      .vertex_range = vertex_range,
+      .padded_vertex_count =
+         padded_vertex_count(vertex_range, instance_count, false),
+      .primitive_vertex_count = 1,
+      .indices = index_buffer_ptr,
+
+      .heap = heap,
+   };
+
+   panlib_patch_draw(&draw);
+
+   *first_vertex_sysval = draw.vertex.base;
+   *first_instance_sysval = draw.instance.base;
+   *raw_vertex_offset_sysval = draw.vertex.raw_offset;
+
+   pan_unpack(&varying_bufs_descs[PANLIB_VARY_BUF_GENERAL], ATTRIBUTE_BUFFER,
+              general);
+   gs_in_bufs[0] = draw.position;
+   gs_in_bufs[1] = writes_psiz ? draw.psiz : 0;
+   gs_in_bufs[2] = general.pointer;
+   *gs_index_bias = min_vertex;
+   *gs_instance_stride = instance_count > 1 ? draw.padded_vertex_count : 0;
 }
 
 /* A multi-draw: one invocation per draw of a vkCmdDrawIndexedIndirect, so the

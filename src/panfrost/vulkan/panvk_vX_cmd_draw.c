@@ -997,6 +997,8 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
    used_set_mask |= cmdbuf->state.gfx.vs.shader->desc_info.used_set_mask;
    if (fs)
       used_set_mask |= cmdbuf->state.gfx.fs.shader->desc_info.used_set_mask;
+   if (cmdbuf->state.gfx.gs.shader)
+      used_set_mask |= cmdbuf->state.gfx.gs.shader->desc_info.used_set_mask;
 
    for (uint32_t i = 0; i < MAX_SETS; i++) {
       if (used_set_mask & BITFIELD_BIT(i)) {

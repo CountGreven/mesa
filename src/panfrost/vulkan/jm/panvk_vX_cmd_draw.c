@@ -1528,6 +1528,7 @@ panvk_gs_emit_buf(struct panvk_cmd_buffer *cmdbuf,
 
 struct panvk_gs_draw {
    uint64_t params;
+   struct pan_gs_params *params_cpu;
    uint64_t vs_bufs, gs_bufs;
    uint64_t out_pos, out_psiz, out_index;
    uint32_t out_verts, index_count;
@@ -1543,10 +1544,16 @@ panvk_gs_prepare_buffers(struct panvk_cmd_buffer *cmdbuf,
                          const struct pan_gs_info *gsi, uint32_t ppi,
                          uint32_t padded, struct panvk_gs_draw *gd)
 {
+   /* An indexed draw's vertex range is only known on the GPU: the draw
+    * helper allocates the vertex job's buffers and fills in their addresses,
+    * the index bias and the instance stride (panlib_draw_indexed_gs_helper).
+    */
+   const bool indexed = draw->info.index.index_size != 0;
    const struct pan_varying_layout *vs_layout = &vs->info.varyings.formats;
    const uint64_t in_prims = (uint64_t)ppi * draw->info.instance.count;
    const uint64_t invocations = in_prims * gsi->invocations;
-   const uint64_t records = (uint64_t)padded * draw->info.instance.count;
+   const uint64_t records =
+      indexed ? 0 : (uint64_t)padded * draw->info.instance.count;
 
    struct pan_ptr p =
       panvk_cmd_alloc_dev_mem(cmdbuf, desc, sizeof(struct pan_gs_params), 16);
@@ -1576,9 +1583,9 @@ panvk_gs_prepare_buffers(struct panvk_cmd_buffer *cmdbuf,
                                             2, records, NULL)
                         : panvk_gs_emit_buf(cmdbuf, &vb[PANVK_VARY_BUF_PSIZ],
                                             0, 0, NULL);
-   if (!params->in_pos ||
-       (vs_layout->generic_size_B && !params->in_general) ||
-       (vs->info.vs.writes_point_size && !params->in_psiz))
+   if (!indexed && (!params->in_pos ||
+                    (vs_layout->generic_size_B && !params->in_general) ||
+                    (vs->info.vs.writes_point_size && !params->in_psiz)))
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    params->in_offsets =
       panvk_priv_mem_dev_addr(cmdbuf->state.gfx.gs.link.in_offsets);
@@ -1614,8 +1621,11 @@ panvk_gs_prepare_buffers(struct panvk_cmd_buffer *cmdbuf,
    params->out_pos = gd->out_pos;
    params->out_psiz = gd->out_psiz;
    params->out_index = gd->out_index;
-   params->index_buf = 0;
-   params->index_size = 0;
+   params->index_buf =
+      indexed ? draw->info.index.buffer_dev_addr +
+                   (uint64_t)draw->info.index.offset * draw->info.index.index_size
+              : 0;
+   params->index_size = draw->info.index.index_size;
    params->topology = panvk_gs_topology(draw->info.prim);
    params->prims_per_instance = ppi;
    params->instance_stride = draw->info.instance.count > 1 ? padded : 0;
@@ -1629,6 +1639,7 @@ panvk_gs_prepare_buffers(struct panvk_cmd_buffer *cmdbuf,
    params->layer_stride = gd->layer_stride;
 
    gd->params = p.gpu;
+   gd->params_cpu = p.cpu;
    gd->vs_bufs = vs_bufs.gpu;
    gd->gs_bufs = gs_bufs.gpu;
    gd->wg = DIV_ROUND_UP(invocations, PAN_GS_WORKGROUP_SIZE);
@@ -1748,6 +1759,129 @@ panvk_gs_emit_tiler_job(struct panvk_cmd_buffer *cmdbuf,
       ;
 }
 
+/* An indexed draw's index range is only known on the GPU: the min/max search
+ * and the indexed draw helper, without a tiler job, which also fill in the
+ * vertex side of the draw's pan_gs_params. Returns the job the vertex job
+ * waits for, 0 on failure.
+ */
+static unsigned
+panvk_gs_emit_index_helper(struct panvk_cmd_buffer *cmdbuf,
+                           const struct panvk_draw_data *draw,
+                           const struct panvk_shader_variant *vs,
+                           uint64_t vs_push_uniforms,
+                           const struct panvk_gs_draw *gd, unsigned dep,
+                           uint64_t vertex_job)
+{
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+   const struct vk_vertex_input_state *vi =
+      cmdbuf->vk.dynamic_graphics_state.vi;
+   const uint32_t index_size = draw->info.index.index_size;
+
+   unsigned init_heap_job_id;
+   if (panvk_per_arch(cmd_init_poly_heap)(cmdbuf, &init_heap_job_id) !=
+       VK_SUCCESS)
+      return 0;
+
+   /* The command the helper reads, as vkCmdDrawIndexed would have written. */
+   struct pan_ptr cmd = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc, sizeof(struct VkDrawIndexedIndirectCommand), 8);
+   struct pan_ptr res = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc, sizeof(struct libpan_draw_helper_index_min_max_result), 8);
+   struct pan_ptr write_job =
+      pan_pool_alloc_desc(&cmdbuf->desc_pool.base, WRITE_VALUE_JOB);
+   if (!cmd.gpu || !res.gpu || !write_job.gpu)
+      return 0;
+
+   *(struct VkDrawIndexedIndirectCommand *)cmd.cpu =
+      (struct VkDrawIndexedIndirectCommand){
+         .indexCount = draw->info.vertex.count,
+         .instanceCount = draw->info.instance.count,
+         .firstIndex = draw->info.index.offset,
+         .vertexOffset = draw->info.vertex.base,
+         .firstInstance = draw->info.instance.base,
+      };
+
+   struct libpan_draw_helper_index_min_max_result val = {
+      .min = ((uint64_t)1 << (index_size * 8)) - 1,
+      .max = 0,
+   };
+   pan_section_pack(write_job.cpu, WRITE_VALUE_JOB, PAYLOAD, payload) {
+      payload.type = MALI_WRITE_VALUE_TYPE_IMMEDIATE_64;
+      payload.address = res.gpu;
+      payload.immediate_value = *(uint64_t *)&val;
+   }
+   const unsigned write_job_id = pan_jc_add_job(
+      &batch->vtc_jc, MALI_JOB_TYPE_WRITE_VALUE, false, false, 0, dep,
+      &write_job, false);
+   util_dynarray_append(&batch->jobs, write_job.cpu);
+
+   struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+   const struct panlib_draw_index_minmax_search_helper_args search = {
+      .index_buffer_ptr = draw->info.index.buffer_dev_addr,
+      .cmd = cmd.gpu,
+      .min_ptr = res.gpu +
+                 offsetof(struct libpan_draw_helper_index_min_max_result, min),
+      .max_ptr = res.gpu +
+                 offsetof(struct libpan_draw_helper_index_min_max_result, max),
+   };
+   const uint32_t max_index_count =
+      draw->info.index.buffer_size / index_size;
+   const uint32_t wg_count = MAX2(DIV_ROUND_UP(max_index_count, 65536), 1);
+   panlib_draw_index_minmax_search_helper_struct(
+      &precomp_ctx, panlib_1d_with_jm_deps(wg_count, 0, write_job_id),
+      PANLIB_BARRIER_NONE, search, util_logbase2(index_size), false);
+   const unsigned search_job = batch->vtc_jc.job_index;
+
+   uint64_t first_vertex_sysval = 0x8ull << 60;
+   uint64_t first_instance_sysval = 0x8ull << 60;
+   uint64_t raw_vertex_offset_sysval = 0x8ull << 60;
+   if (shader_uses_sysval(vs, graphics, vs.first_vertex)) {
+      first_vertex_sysval =
+         vs_push_uniforms +
+         shader_remapped_sysval_offset(vs, sysval_offset(graphics, vs.first_vertex));
+   }
+   if (shader_uses_sysval(vs, graphics, vs.base_instance)) {
+      first_instance_sysval =
+         vs_push_uniforms +
+         shader_remapped_sysval_offset(vs, sysval_offset(graphics, vs.base_instance));
+   }
+   if (shader_uses_sysval(vs, graphics, vs.raw_vertex_offset)) {
+      raw_vertex_offset_sysval =
+         vs_push_uniforms + shader_remapped_sysval_offset(
+                               vs, sysval_offset(graphics, vs.raw_vertex_offset));
+   }
+
+   const struct panlib_draw_indexed_gs_helper_args args = {
+      .cmd = cmd.gpu,
+      .index_buffer_ptr = draw->info.index.buffer_dev_addr,
+      .index_min_max_res = res.gpu,
+      .heap = panvk_priv_mem_dev_addr(dev->poly_heap.state),
+      .varying_bufs_descs = gd->vs_bufs,
+      .attrib_bufs_descs = draw->vs.attribute_bufs,
+      .attrib_bufs_infos = draw->indirect_info.attrib_bufs,
+      .attribs_descs = draw->vs.attributes,
+      .attribs_infos = draw->indirect_info.attribs,
+      .first_vertex_sysval = first_vertex_sysval,
+      .first_instance_sysval = first_instance_sysval,
+      .raw_vertex_offset_sysval = raw_vertex_offset_sysval,
+      .vertex_job = vertex_job,
+      .gs_in_bufs = gd->params + offsetof(struct pan_gs_params, in_pos),
+      .gs_index_bias = gd->params + offsetof(struct pan_gs_params, index_bias),
+      .gs_instance_stride =
+         gd->params + offsetof(struct pan_gs_params, instance_stride),
+      .index_size = index_size,
+      .attrib_bufs_valid = vi->bindings_valid,
+      .attribs_valid = vi->attributes_valid,
+      .writes_psiz = vs->info.vs.writes_point_size,
+   };
+   panlib_draw_indexed_gs_helper_struct(
+      &precomp_ctx, panlib_1d_with_jm_deps(1, init_heap_job_id, search_job),
+      PANLIB_BARRIER_JM_SUPPRESS_PREFETCH, args);
+
+   return batch->vtc_jc.job_index;
+}
+
 static void
 panvk_cmd_draw_gs(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
 {
@@ -1765,6 +1899,14 @@ panvk_cmd_draw_gs(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
    if (!vs->own_bin || (!vs_empty && !panvk_priv_mem_check_alloc(vs->rsd)) ||
        !panvk_priv_mem_check_alloc(gs_var->rsd)) {
       mesa_logw_once("panvk: vertex shader not compiled for a geometry stage");
+      return;
+   }
+
+   const bool indexed = draw->info.index.index_size != 0;
+   if (indexed && draw->info.index.restart_enable &&
+       panvk_gs_topology(draw->info.prim) != PAN_GS_TOPO_LIST) {
+      mesa_logw_once("panvk: geometry shader with primitive restart is not "
+                     "emulated yet");
       return;
    }
 
@@ -1805,9 +1947,10 @@ panvk_cmd_draw_gs(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
    /* The vertex job writes every record the geometry shader may read: no
     * IDVS alignment for the instance stride.
     */
-   const uint32_t padded = draw->info.instance.count > 1
-                              ? pan_padded_vertex_count(draw->vertex_range)
-                              : draw->vertex_range;
+   const uint32_t padded =
+      indexed ? 0
+      : draw->info.instance.count > 1 ? pan_padded_vertex_count(draw->vertex_range)
+                                      : draw->vertex_range;
    draw->padded_vertex_count = padded;
 
    cmdbuf->state.gfx.fs.required =
@@ -1854,15 +1997,28 @@ panvk_cmd_draw_gs(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
                                                           &vs_push, 1);
    if (result != VK_SUCCESS)
       return;
+   /* The geometry shader's dynamic SSBOs sit in the vertex shader's table
+    * slot (its descriptors were lowered like a vertex shader's).
+    */
+   const uint64_t vs_dyn_ssbos =
+      cmdbuf->state.gfx.sysvals.desc.sets[PANVK_DESC_TABLE_VS_DYN_SSBOS];
+   cmdbuf->state.gfx.sysvals.desc.sets[PANVK_DESC_TABLE_VS_DYN_SSBOS] =
+      cmdbuf->state.gfx.gs.desc.dyn_ssbos;
    result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(cmdbuf, gs_var,
                                                           &gs_push, 1);
+   cmdbuf->state.gfx.sysvals.desc.sets[PANVK_DESC_TABLE_VS_DYN_SSBOS] =
+      vs_dyn_ssbos;
    if (result != VK_SUCCESS)
       return;
 
-   /* The vertex job. */
-   pan_pack_work_groups_compute(&draw->invocation, 1, draw->vertex_range,
-                                draw->info.instance.count, 1, 1, 1, true,
-                                false);
+   /* The vertex job: the helper fills in an indexed draw's invocation,
+    * offset and instance size.
+    */
+   if (!indexed) {
+      pan_pack_work_groups_compute(&draw->invocation, 1, draw->vertex_range,
+                                   draw->info.instance.count, 1, 1, 1, true,
+                                   false);
+   }
    struct pan_ptr vjob = panvk_cmd_alloc_desc(cmdbuf, COMPUTE_JOB);
    struct pan_ptr gsjob = panvk_cmd_alloc_desc(cmdbuf, COMPUTE_JOB);
    if (!vjob.gpu || !gsjob.gpu)
@@ -1885,8 +2041,10 @@ panvk_cmd_draw_gs(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
          panvk_priv_mem_dev_addr(cmdbuf->state.gfx.gs.link.vs_attribs);
       cfg.varying_buffers = gd.vs_bufs;
       cfg.thread_storage = draw->tls;
-      cfg.offset_start = draw->info.vertex.raw_offset;
-      cfg.instance_size = draw->info.instance.count > 1 ? padded : 1;
+      if (!indexed) {
+         cfg.offset_start = draw->info.vertex.raw_offset;
+         cfg.instance_size = draw->info.instance.count > 1 ? padded : 1;
+      }
       cfg.uniform_buffers = vs_desc_state->tables[PANVK_BIFROST_DESC_TABLE_UBO];
       cfg.push_uniforms = vs_push.gpu;
       cfg.textures = vs_desc_state->tables[PANVK_BIFROST_DESC_TABLE_TEXTURE];
@@ -1935,10 +2093,17 @@ panvk_cmd_draw_gs(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
          ? pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_COMPUTE, false, false,
                           0, 0, &gs_copy_job, false)
          : 0;
+   unsigned vs_dep = vs_copy;
+   if (indexed && !vs_empty) {
+      vs_dep = panvk_gs_emit_index_helper(cmdbuf, draw, vs, vs_push.gpu,
+                                          &gd, vs_copy, vjob.gpu);
+      if (!vs_dep)
+         return;
+   }
    const unsigned v =
       vs_empty ? vs_copy
                : pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_VERTEX, false,
-                                false, 0, vs_copy, &vjob, false);
+                                indexed, 0, vs_dep, &vjob, false);
    const unsigned c = pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_COMPUTE,
                                      true, true, v, gs_copy, &gsjob, false);
 
@@ -2070,6 +2235,12 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
    /* If there's no vertex shader, we can skip the draw. */
    if (!panvk_priv_mem_check_alloc(vs->rsd))
       return;
+
+   if (cmdbuf->state.gfx.gs.shader) {
+      mesa_logw_once("panvk: indirect draws through a geometry shader are not "
+                     "emulated yet");
+      return;
+   }
 
    /* Needs to be done before get_fs() is called because it depends on
     * fs.required being initialized. */
@@ -2589,6 +2760,17 @@ panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
          .prim = panvk_get_client_prim(cmdbuf),
       },
    };
+
+   /* The geometry shader emulation sizes its buffers from the counts. */
+   if (cmdbuf->state.gfx.gs.shader) {
+      draw.info.index.offset = firstIndex;
+      draw.info.vertex.base = vertexOffset;
+      draw.info.vertex.count = indexCount;
+      draw.info.instance.base = firstInstance;
+      draw.info.instance.count = instanceCount;
+      panvk_cmd_draw_gs(cmdbuf, &draw);
+      return;
+   }
 
    panvk_cmd_draw_indirect(cmdbuf, &draw);
 }
