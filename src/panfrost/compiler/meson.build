@@ -12,6 +12,7 @@ libpanfrost_compiler_files = files(
   'pan_nir_lower_fs_inputs.c',
   'pan_nir_hoist_atest.c',
   'pan_nir_lower_fs_outputs.c',
+  'pan_nir_lower_gs.c',
   'pan_nir_lower_helper_invocation.c',
   'pan_nir_lower_image.c',
   'pan_nir_lower_image_64bit.c',
