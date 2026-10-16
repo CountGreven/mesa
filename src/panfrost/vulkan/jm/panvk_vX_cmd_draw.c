@@ -43,6 +43,14 @@
 
 struct panvk_draw_data {
    struct panvk_draw_info info;
+   /* An indexed adjacency draw without a geometry shader: the job that
+    * rewrites its indices for the base primitive (panlib_adjacency_to_base).
+    */
+   struct {
+      uint64_t src, dst;
+      uint32_t index_size, count, mode;
+      bool restart;
+   } adj;
    unsigned vertex_range;
    unsigned padded_vertex_count;
    struct mali_invocation_packed invocation;
@@ -475,8 +483,11 @@ panvk_draw_prepare_varyings(struct panvk_cmd_buffer *cmdbuf,
 
    if (writes_point_size)
       draw->psiz = psiz_buf;
-   else if (ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST ||
-            ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP)
+   else if (draw->info.prim == MESA_PRIM_LINES ||
+            draw->info.prim == MESA_PRIM_LINE_STRIP)
+      /* The primitive drawn: an adjacency draw without a geometry shader
+       * draws its base primitive (panvk_draw_adjacency_as_base).
+       */
       draw->line_width = cmdbuf->vk.dynamic_graphics_state.rs.line.width;
    else
       draw->line_width = 1.0f;
@@ -2242,6 +2253,15 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
       return;
    }
 
+   /* No adjacency draw modes on v6/v7: direct draws are rewritten for the
+    * base primitive (panvk_draw_adjacency_as_base), indirect ones are not.
+    */
+   if (mesa_prim_has_adjacency(draw->info.prim)) {
+      mesa_logw_once("panvk: indirect adjacency draws without a geometry "
+                     "shader are not supported");
+      return;
+   }
+
    /* Needs to be done before get_fs() is called because it depends on
     * fs.required being initialized. */
    cmdbuf->state.gfx.fs.required =
@@ -2284,6 +2304,24 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
    struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
    uint64_t index_min_max_res_ptr = 0;
    uint32_t job_before_indirect_helper = copy_desc_job_id;
+
+   unsigned adj_job_id = 0;
+   if (draw->adj.count) {
+      const struct panlib_adjacency_to_base_args args = {
+         .src = draw->adj.src,
+         .dst = draw->adj.dst,
+         .count = draw->adj.count,
+         .index_size = draw->adj.index_size,
+         .mode = draw->adj.mode,
+         .restart = draw->adj.restart,
+      };
+      panlib_adjacency_to_base_struct(
+         &precomp_ctx,
+         panlib_1d_with_jm_deps(DIV_ROUND_UP(draw->adj.count, 64), 0,
+                                copy_desc_job_id),
+         PANLIB_BARRIER_NONE, args);
+      adj_job_id = batch->vtc_jc.job_index;
+   }
    if (draw->info.index.index_size) {
       index_min_max_res_ptr =
          panvk_cmd_alloc_dev_mem(
@@ -2318,7 +2356,7 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
 
       unsigned write_job_id =
          pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_WRITE_VALUE, false, false,
-                        0, copy_desc_job_id, &write_job, false);
+                        adj_job_id, copy_desc_job_id, &write_job, false);
       util_dynarray_append(&batch->jobs, write_job.cpu);
 
       const uint32_t index_count =
@@ -2687,6 +2725,96 @@ padded_vertex_count(struct panvk_cmd_buffer *cmdbuf, uint32_t vertex_count,
    return pan_padded_vertex_count(vertex_count);
 }
 
+/* Without a geometry shader an adjacency primitive draws as its base
+ * primitive, the adjacent vertices ignored (as the gallium driver does): an
+ * indexed draw over the vertices kept, its indices written on the CPU for a
+ * draw without indices, by panlib_adjacency_to_base for one with.
+ */
+static bool
+panvk_draw_adjacency_as_base(struct panvk_cmd_buffer *cmdbuf,
+                             const struct panvk_draw_info *info,
+                             bool indexed)
+{
+   enum mesa_prim mode;
+   const uint32_t n = info->vertex.count;
+   uint32_t out_count;
+
+   switch (info->prim) {
+   case MESA_PRIM_LINES_ADJACENCY:
+      mode = MESA_PRIM_LINES;
+      out_count = n / 4 * 2;
+      break;
+   case MESA_PRIM_LINE_STRIP_ADJACENCY:
+      mode = MESA_PRIM_LINE_STRIP;
+      out_count = n >= 4 ? n - 2 : 0;
+      break;
+   case MESA_PRIM_TRIANGLES_ADJACENCY:
+      mode = MESA_PRIM_TRIANGLES;
+      out_count = n / 6 * 3;
+      break;
+   case MESA_PRIM_TRIANGLE_STRIP_ADJACENCY:
+      mode = MESA_PRIM_TRIANGLE_STRIP;
+      out_count = n >= 6 ? (n - 4) / 2 + 2 : 0;
+      break;
+   default:
+      return false;
+   }
+
+   if (!out_count)
+      return true;
+
+   struct pan_ptr idx =
+      panvk_cmd_alloc_dev_mem(cmdbuf, desc, out_count * sizeof(uint32_t), 64);
+   struct pan_ptr cmd = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc, sizeof(struct VkDrawIndexedIndirectCommand), 8);
+   if (!idx.gpu || !cmd.gpu)
+      return true;
+
+   struct panvk_draw_data draw = {
+      .info = {
+         .index = {
+            .buffer_dev_addr = idx.gpu,
+            .buffer_size = out_count * sizeof(uint32_t),
+            .index_size = 4,
+            .restart_enable = indexed && info->index.restart_enable,
+         },
+         .indirect.buffer_dev_addr = cmd.gpu,
+         .indirect.draw_count = 1,
+         .prim = mode,
+      },
+   };
+
+   if (indexed) {
+      draw.adj.src = info->index.buffer_dev_addr +
+                     (uint64_t)info->index.offset * info->index.index_size;
+      draw.adj.dst = idx.gpu;
+      draw.adj.index_size = info->index.index_size;
+      draw.adj.count = out_count;
+      draw.adj.mode = mode;
+      draw.adj.restart = info->index.restart_enable;
+   } else {
+      uint32_t *dst = idx.cpu;
+      for (uint32_t o = 0; o < out_count; o++) {
+         dst[o] = mode == MESA_PRIM_LINES        ? o / 2 * 4 + 1 + o % 2
+                  : mode == MESA_PRIM_LINE_STRIP ? o + 1
+                  : mode == MESA_PRIM_TRIANGLES  ? o / 3 * 6 + o % 3 * 2
+                                                 : o * 2;
+      }
+   }
+
+   *(struct VkDrawIndexedIndirectCommand *)cmd.cpu =
+      (struct VkDrawIndexedIndirectCommand){
+         .indexCount = out_count,
+         .instanceCount = info->instance.count,
+         .firstIndex = 0,
+         .vertexOffset = info->vertex.base,
+         .firstInstance = info->instance.base,
+      };
+
+   panvk_cmd_draw_indirect(cmdbuf, &draw);
+   return true;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdDraw)(VkCommandBuffer commandBuffer, uint32_t vertexCount,
                         uint32_t instanceCount, uint32_t firstVertex,
@@ -2718,6 +2846,10 @@ panvk_per_arch(CmdDraw)(VkCommandBuffer commandBuffer, uint32_t vertexCount,
       .padded_vertex_count =
          padded_vertex_count(cmdbuf, vertexCount, instanceCount),
    };
+
+   if (!cmdbuf->state.gfx.gs.shader &&
+       panvk_draw_adjacency_as_base(cmdbuf, &draw.info, false))
+      return;
 
    panvk_cmd_draw(cmdbuf, &draw);
 }
@@ -2762,13 +2894,16 @@ panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
    };
 
    /* The geometry shader emulation sizes its buffers from the counts. */
-   if (cmdbuf->state.gfx.gs.shader) {
+   if (cmdbuf->state.gfx.gs.shader || mesa_prim_has_adjacency(draw.info.prim)) {
       draw.info.index.offset = firstIndex;
       draw.info.vertex.base = vertexOffset;
       draw.info.vertex.count = indexCount;
       draw.info.instance.base = firstInstance;
       draw.info.instance.count = instanceCount;
-      panvk_cmd_draw_gs(cmdbuf, &draw);
+      if (cmdbuf->state.gfx.gs.shader)
+         panvk_cmd_draw_gs(cmdbuf, &draw);
+      else
+         panvk_draw_adjacency_as_base(cmdbuf, &draw.info, true);
       return;
    }
 

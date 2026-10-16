@@ -800,3 +800,38 @@ panlib_draw_index_minmax_multi_search_helper(
                  index_bytes_log2__3, primitive_restart__2, cl_global_id.x);
 }
 #endif
+
+#if (PAN_ARCH == 6 || PAN_ARCH == 7)
+/* Without a geometry shader an adjacency primitive draws as its base
+ * primitive, the adjacent vertices ignored: one invocation per index kept
+ * (1, 2 of each 4; 1 .. n - 2; 0, 2, 4 of each 6; the even ones of a strip),
+ * widened to 32 bits, a narrower restart index widened with it.
+ */
+KERNEL(64)
+panlib_adjacency_to_base(global uint8_t *src, global uint32_t *dst,
+                         uint32_t count, uint32_t index_size, uint32_t mode,
+                         uint32_t restart)
+{
+   const uint32_t o = cl_global_id.x;
+   if (o >= count)
+      return;
+
+   const uint32_t v = mode == MESA_PRIM_LINES        ? o / 2 * 4 + 1 + o % 2
+                      : mode == MESA_PRIM_LINE_STRIP ? o + 1
+                      : mode == MESA_PRIM_TRIANGLES  ? o / 3 * 6 + o % 3 * 2
+                                                     : o * 2;
+   uint32_t idx;
+   if (index_size == 1) {
+      idx = src[v];
+      if (restart && idx == 0xff)
+         idx = UINT32_MAX;
+   } else if (index_size == 2) {
+      idx = ((global uint16_t *)src)[v];
+      if (restart && idx == 0xffff)
+         idx = UINT32_MAX;
+   } else {
+      idx = ((global uint32_t *)src)[v];
+   }
+   dst[o] = idx;
+}
+#endif
