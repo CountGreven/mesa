@@ -819,6 +819,55 @@ lower_tex_immutable(nir_builder *b, nir_tex_instr *tex,
    }
 }
 
+#if PAN_ARCH < 9
+/* The Bifrost LOD query returns (round_even(clamped lod), unclamped lod). The
+ * accessed level is only rounded for a NEAREST mipmap mode: with LINEAR it is
+ * the clamped lod itself. The mode is in the sampler descriptor, so pick the
+ * level at run time, as the Valhall lowering does.
+ */
+static void
+lower_tex_lod_level(nir_builder *b, nir_tex_instr *tex,
+                    const struct lower_desc_ctx *ctx)
+{
+   int tex_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   int samp_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+   if (tex_src_idx < 0 || samp_src_idx < 0)
+      return;
+
+   nir_deref_instr *tex_deref = nir_src_as_deref(tex->src[tex_src_idx].src);
+   nir_deref_instr *samp_deref = nir_src_as_deref(tex->src[samp_src_idx].src);
+
+   b->cursor = nir_after_instr(&tex->instr);
+
+   nir_def *samp = load_resource_deref_desc(
+      b, samp_deref, VK_DESCRIPTOR_TYPE_SAMPLER, 0, 2, 32, ctx);
+   nir_def *samp_w0 = nir_channel(b, samp, 0);
+   nir_def *samp_w1 = nir_channel(b, samp, 1);
+
+   /* Minimum and maximum LOD: word1[0:12] and word1[16:28], 8.8 fixed. */
+   nir_def *min_lod = nir_fdiv_imm(
+      b, nir_u2f32(b, nir_ubitfield_extract_imm(b, samp_w1, 0, 13)), 256.0);
+   nir_def *max_lod = nir_fdiv_imm(
+      b, nir_u2f32(b, nir_ubitfield_extract_imm(b, samp_w1, 16, 13)), 256.0);
+   nir_def *levels =
+      load_tex_levels(b, tex_deref, tex->sampler_dim, ctx);
+   max_lod = nir_fmin(b, max_lod, nir_u2f32(b, nir_iadd_imm(b, levels, -1)));
+
+   nir_def *lod = nir_channel(b, &tex->def, 1);
+   nir_def *linear_level = nir_fclamp(b, lod, min_lod, max_lod);
+
+   /* Mipmap mode: word0[30:31], 2 and 3 are the trilinear modes. */
+   nir_def *mipmap_mode = nir_ubitfield_extract_imm(b, samp_w0, 30, 2);
+   nir_def *level = nir_bcsel(b, nir_uge_imm(b, mipmap_mode, 2), linear_level,
+                              nir_channel(b, &tex->def, 0));
+
+   nir_def *result = nir_vec2(b, level, lod);
+   nir_def_rewrite_uses_after(&tex->def, result);
+
+   b->cursor = nir_before_instr(&tex->instr);
+}
+#endif
+
 static bool
 lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
 {
@@ -869,6 +918,9 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
       nir_def_replace(&tex->def, res);
       return true;
    }
+
+   if (tex->op == nir_texop_lod)
+      lower_tex_lod_level(b, tex, ctx);
 #endif
 
    uint32_t plane = 0;
