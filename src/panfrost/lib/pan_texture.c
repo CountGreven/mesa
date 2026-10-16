@@ -1099,17 +1099,15 @@ pan_emit_iview_texture_payload(const struct pan_image_view *iview,
       }
    }
 #else
-   unsigned face_count = 1;
-
-   if (iview->dim == MALI_TEXTURE_DIMENSION_CUBE) {
-      first_layer_or_z_slice /= 6;
-      last_layer_or_z_slice /= 6;
-      face_count = 6;
-   }
+   /* A cube view covers whole cubes of 6 layers, starting at its first layer,
+    * which need not be a multiple of 6.
+    */
+   unsigned face_count =
+      iview->dim == MALI_TEXTURE_DIMENSION_CUBE ? 6 : 1;
 
    /* V6 and earlier has a different memory-layout */
    for (int layer = first_layer_or_z_slice; layer <= last_layer_or_z_slice;
-        ++layer) {
+        layer += face_count) {
       for (int level = iview->first_level; level <= iview->last_level;
            ++level) {
          /* order of face and sample doesn't matter; we can only have multiple
@@ -1118,7 +1116,7 @@ pan_emit_iview_texture_payload(const struct pan_image_view *iview,
          for (int face = 0; face < face_count; ++face) {
             for (int sample = 0; sample < nr_samples; ++sample) {
                mod_handler->emit_tex_payload_entry(
-                  iview, level, (face_count * layer) + face, sample, &payload);
+                  iview, level, layer + face, sample, &payload);
             }
          }
       }
