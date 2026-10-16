@@ -56,7 +56,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .KHR_create_renderpass2 = true,
       .KHR_dedicated_allocation = true,
       .KHR_descriptor_update_template = true,
-      .KHR_depth_clamp_zero_one = true,
+      .KHR_depth_clamp_zero_one = PAN_ARCH != 6,
       .KHR_depth_stencil_resolve = true,
       .KHR_device_group = true,
       .KHR_draw_indirect_count = PAN_ARCH >= 10,
@@ -152,7 +152,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_debug_marker = true,
       .EXT_depth_bias_control = true,
       .EXT_depth_clamp_control = true,
-      .EXT_depth_clamp_zero_one = true,
+      .EXT_depth_clamp_zero_one = PAN_ARCH != 6,
       .EXT_depth_clip_enable = true,
       .EXT_depth_clip_control = true,
       .EXT_device_address_binding_report = true,
@@ -479,8 +479,11 @@ panvk_per_arch(get_physical_device_features)(
       .hostImageCopy = true,
       .pushDescriptor = true,
 
-      /* VK_KHR_depth_clamp_zero_one */
-      .depthClampZeroOne = true,
+      /* VK_KHR_depth_clamp_zero_one: v6 clips and clamps depth against one
+       * range, so it cannot clip at the viewport range and clamp biased depth
+       * to [0, 1] at the same time.
+       */
+      .depthClampZeroOne = PAN_ARCH != 6,
 
       /* VK_KHR_compute_shader_derivatives */
       .computeDerivativeGroupQuads = PAN_ARCH >= 9,
