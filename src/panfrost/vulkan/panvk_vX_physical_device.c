@@ -309,7 +309,7 @@ panvk_per_arch(get_physical_device_features)(
       .fullDrawIndexUint32 = true,
       .imageCubeArray = true,
       .independentBlend = true,
-      .geometryShader = false,
+      .geometryShader = PAN_ARCH <= 7,
       .tessellationShader = false,
       .sampleRateShading = true,
       .dualSrcBlend = true,
@@ -940,11 +940,12 @@ panvk_per_arch(get_physical_device_properties)(
       .maxTessellationEvaluationInputComponents = 0,
       .maxTessellationEvaluationOutputComponents = 0,
       /* Geometry shaders not supported. */
-      .maxGeometryShaderInvocations = 0,
-      .maxGeometryInputComponents = 0,
-      .maxGeometryOutputComponents = 0,
-      .maxGeometryOutputVertices = 0,
-      .maxGeometryTotalOutputComponents = 0,
+      /* Geometry shaders are emulated on JM (pan_gs.h): the Vulkan minimums. */
+      .maxGeometryShaderInvocations = PAN_ARCH <= 7 ? 32 : 0,
+      .maxGeometryInputComponents = PAN_ARCH <= 7 ? 64 : 0,
+      .maxGeometryOutputComponents = PAN_ARCH <= 7 ? 64 : 0,
+      .maxGeometryOutputVertices = PAN_ARCH <= 7 ? 256 : 0,
+      .maxGeometryTotalOutputComponents = PAN_ARCH <= 7 ? 1024 : 0,
       /* 32 vec4 varyings. */
       .maxFragmentInputComponents = 128,
       /* 8 render targets. */

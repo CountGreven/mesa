@@ -138,6 +138,12 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
       break;
 #endif
 
+#if PAN_ARCH < 9
+   case nir_intrinsic_load_geometry_param_buffer_poly:
+      val = load_sysval(b, graphics, bit_size, gs_params);
+      break;
+#endif
+
    case nir_intrinsic_load_draw_id:
       /* Multidraw is supported on v10. */
       if (PAN_ARCH >= 10)
@@ -442,9 +448,11 @@ panvk_preprocess_nir(struct vk_physical_device *vk_pdev,
 
 #if PAN_ARCH < 9
    /* This needs to be done just after the io_to_temporaries pass, because we
-    * rely on out temporaries to collect the final layer_id value.
+    * rely on out temporaries to collect the final layer_id value. The
+    * geometry shader emulation routes gl_Layer itself (pan_nir_lower_gs).
     */
-   NIR_PASS(_, nir, lower_layer_writes);
+   if (nir->info.stage != MESA_SHADER_GEOMETRY)
+      NIR_PASS(_, nir, lower_layer_writes);
 #endif
 
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
@@ -1483,9 +1491,36 @@ panvk_compile_shader(struct panvk_device *dev,
 
    switch (info->stage) {
    case MESA_SHADER_VERTEX: {
-      const enum panvk_vs_variant last_variant = PANVK_VS_VARIANT_HW;
+      bool wanted[PANVK_VS_VARIANTS] = {[PANVK_VS_VARIANT_HW] = true};
+#if PAN_ARCH < 9
+      wanted[PANVK_VS_VARIANT_GS] =
+         info->next_stage_mask & VK_SHADER_STAGE_GEOMETRY_BIT;
+#endif
+      enum panvk_vs_variant last_variant = PANVK_VS_VARIANT_HW;
+      for (enum panvk_vs_variant v = 0; v < PANVK_VS_VARIANTS; v++) {
+         if (wanted[v])
+            last_variant = v;
+      }
+
       for (enum panvk_vs_variant v = 0; v <= last_variant; v++) {
          struct panvk_shader_variant *variant = &shader->variants[v];
+         if (!wanted[v])
+            continue;
+
+#if PAN_ARCH < 9
+         /* The geometry shader emulation reads clip-space positions from
+          * memory: no IDVS, no viewport transform, no noperspective rewrite
+          * (the emulation applies it to its own outputs).
+          */
+         static const uint32_t no_noperspective = 0;
+         const bool gs_input = v == PANVK_VS_VARIANT_GS;
+         inputs.no_idvs = gs_input;
+         inputs.vs_keep_clip_space = gs_input;
+         const uint32_t *variant_noperspective =
+            gs_input ? &no_noperspective : noperspective_varyings;
+#else
+         const uint32_t *variant_noperspective = noperspective_varyings;
+#endif
 
          /* Each variant gets its own NIR. To save an extra clone, we use the
           * original NIR for the last stage.
@@ -1538,17 +1573,14 @@ panvk_compile_shader(struct panvk_device *dev,
          NIR_PASS(_, nir, nir_opt_constant_folding);
 
          struct pan_varying_layout varying_layout;
-         if (v == PANVK_VS_VARIANT_HW) {
-            pan_varying_collect_formats(&varying_layout, nir, inputs.gpu_id);
-            pan_build_varying_layout_compact(&varying_layout, nir,
-                                             inputs.gpu_id);
-            inputs.varying_layout = &varying_layout;
-         }
+         pan_varying_collect_formats(&varying_layout, nir, inputs.gpu_id);
+         pan_build_varying_layout_compact(&varying_layout, nir, inputs.gpu_id);
+         inputs.varying_layout = &varying_layout;
 
          variant->own_bin = true;
 
          result = panvk_compile_nir(dev, nir, info->flags, &inputs, state,
-                                    noperspective_varyings,
+                                    variant_noperspective,
                                     &shader->desc_info, variant);
 
          /* If we cloned, it's our job to clean up */
@@ -1664,6 +1696,41 @@ panvk_compile_shader(struct panvk_device *dev,
       }
       break;
    }
+
+#if PAN_ARCH < 9
+   case MESA_SHADER_GEOMETRY: {
+      /* No geometry stage on the job manager: the shader becomes a compute
+       * job between the vertex and the tiler job (pan_gs.h). Descriptors and
+       * sysvals stay in the graphics layout, so they are lowered while the
+       * stage is still GEOMETRY.
+       */
+      struct panvk_shader_variant *variant =
+         (struct panvk_shader_variant *)panvk_shader_only_variant(shader);
+      nir_shader *nir = info->nir;
+
+      panvk_lower_nir(dev, nir, info->set_layout_count, info->set_layouts,
+                      info->robustness, state, &shader->desc_info, false);
+
+      nir_assign_io_var_locations(nir, nir_var_shader_in);
+      nir_assign_io_var_locations(nir, nir_var_shader_out);
+      panvk_lower_nir_io(nir);
+
+      pan_gs_gather_info(nir, &shader->gs);
+      NIR_PASS(_, nir, pan_nir_lower_gs, &shader->gs,
+               noperspective_varyings ? *noperspective_varyings : 0);
+      pan_preprocess_nir(nir, inputs.gpu_id);
+
+      variant->own_bin = true;
+
+      result = panvk_compile_nir(dev, nir, info->flags, &inputs, state, NULL,
+                                 &shader->desc_info, variant);
+      if (result != VK_SUCCESS) {
+         panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+         return result;
+      }
+      break;
+   }
+#endif
 
    default:
       UNREACHABLE("Unknown shader stage");
@@ -2034,6 +2101,16 @@ panvk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
       return result;
    }
 
+#if PAN_ARCH < 9
+   if (stage == MESA_SHADER_GEOMETRY) {
+      blob_copy_bytes(blob, &shader->gs, sizeof(shader->gs));
+      if (blob->overrun) {
+         panvk_shader_destroy(vk_dev, &shader->vk, pAllocator);
+         return panvk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      }
+   }
+#endif
+
    panvk_shader_foreach_variant(shader, variant) {
       result = panvk_deserialize_shader_variant(vk_dev, blob, pAllocator,
                                                 variant);
@@ -2143,6 +2220,11 @@ panvk_shader_serialize(struct vk_device *vk_dev,
    blob_write_uint8(blob, vk_shader->stage);
 
    shader_desc_info_serialize(blob, shader);
+
+#if PAN_ARCH < 9
+   if (vk_shader->stage == MESA_SHADER_GEOMETRY)
+      blob_write_bytes(blob, &shader->gs, sizeof(shader->gs));
+#endif
 
    panvk_shader_foreach_variant(shader, variant) {
       panvk_shader_serialize_variant(vk_dev, variant, blob);
@@ -2580,6 +2662,14 @@ panvk_cmd_bind_shader(struct panvk_cmd_buffer *cmd, const mesa_shader_stage stag
          gfx_state_set_dirty(cmd, FS_PUSH_UNIFORMS);
       }
       break;
+#if PAN_ARCH < 9
+   case MESA_SHADER_GEOMETRY:
+      if (cmd->state.gfx.gs.shader != shader) {
+         cmd->state.gfx.gs.shader = shader;
+         gfx_state_set_dirty(cmd, GS);
+      }
+      break;
+#endif
    default:
       assert(!"Unsupported stage");
       break;
@@ -2707,3 +2797,146 @@ VkResult panvk_per_arch(create_shader)(
 
    return VK_SUCCESS;
 }
+
+#if PAN_ARCH < 9
+static mali_pixel_format
+gs_constant_format(void)
+{
+#if PAN_ARCH >= 7
+   return (MALI_CONSTANT << 12) | MALI_RGB_COMPONENT_ORDER_0000;
+#else
+   return (MALI_CONSTANT << 12) | PAN_V6_SWIZZLE(0, 0, 0, 0);
+#endif
+}
+
+VkResult
+panvk_per_arch(link_gs_shaders)(struct panvk_pool *desc_pool,
+                                const struct panvk_shader_variant *vs,
+                                const struct panvk_shader *gs,
+                                const struct panvk_shader_variant *fs,
+                                struct panvk_gs_link *link)
+{
+   const struct pan_gs_info *gsi = &gs->gs;
+   const struct pan_varying_layout *vs_layout = &vs->info.varyings.formats;
+   pan_varying_layout_require_layout(vs_layout);
+
+   panvk_gs_link_cleanup(link);
+
+   link->in_offsets = panvk_pool_alloc_mem(desc_pool, (struct panvk_pool_alloc_info){
+      .size = 64 * sizeof(uint32_t),
+      .alignment = 4,
+   });
+   if (!panvk_priv_mem_check_alloc(link->in_offsets))
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   uint32_t *in_offsets = panvk_priv_mem_host_addr(link->in_offsets);
+   for (unsigned i = 0; i < 64; i++)
+      in_offsets[i] = PAN_GS_SLOT_UNUSED;
+
+   /* The vertex shader's side: every output it writes is kept, the geometry
+    * shader may read any of them. Positions stay unsnapped in clip space.
+    */
+   if (vs_layout->count) {
+      link->vs_attribs =
+         panvk_pool_alloc_desc_array(desc_pool, vs_layout->count, ATTRIBUTE);
+      if (!panvk_priv_mem_check_alloc(link->vs_attribs))
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+      panvk_priv_mem_write_array(link->vs_attribs, 0,
+                                 struct mali_attribute_packed,
+                                 vs_layout->count, attrs) {
+         for (unsigned i = 0; i < vs_layout->count; i++) {
+            const struct pan_varying_slot *slot =
+               pan_varying_layout_slot_at(vs_layout, i);
+
+            pan_pack(&attrs[i], ATTRIBUTE, cfg) {
+               cfg.format = gs_constant_format();
+               if (!slot)
+                  continue;
+
+               const gl_varying_slot loc = slot->location;
+               if (loc == VARYING_SLOT_POS) {
+                  cfg.buffer_index = PANVK_VARY_BUF_POSITION;
+                  cfg.format = MALI_RGBA32F << 12;
+#if PAN_ARCH <= 6
+                  cfg.format |= pan_get_default_swizzle(4);
+#else
+                  cfg.format |= MALI_RGB_COMPONENT_ORDER_RGBA;
+#endif
+               } else if (loc == VARYING_SLOT_PSIZ) {
+                  cfg.buffer_index = PANVK_VARY_BUF_PSIZ;
+                  cfg.format = varying_format(loc, PIPE_FORMAT_NONE);
+               } else if (slot->section == PAN_VARYING_SECTION_GENERIC) {
+                  enum pipe_format pfmt =
+                     pan_varying_format(slot->alu_type, slot->ncomps);
+                  cfg.buffer_index = PANVK_VARY_BUF_GENERAL;
+                  cfg.offset = slot->offset;
+                  cfg.format = GENX(pan_format_from_pipe_format)(pfmt)->hw;
+                  if (loc < 64) {
+                     in_offsets[loc] =
+                        slot->offset |
+                        (nir_alu_type_get_type_size(slot->alu_type) == 16
+                            ? PAN_GS_IN_16BIT
+                            : 0);
+                  }
+               }
+               cfg.offset_enable = false;
+            }
+         }
+      }
+   }
+
+   /* The fragment shader's side: the emulation's records, 16 bytes per
+    * slot (pan_gs_out_offset), gl_Layer and gl_ViewportIndex in their own
+    * slots, every component 32-bit.
+    */
+   const uint32_t fs_var_count = fs ? fs->info.varyings.formats.count : 0;
+   if (fs_var_count) {
+      pan_varying_layout_require_format(&fs->info.varyings.formats);
+      link->fs_attribs =
+         panvk_pool_alloc_desc_array(desc_pool, fs_var_count, ATTRIBUTE);
+      if (!panvk_priv_mem_check_alloc(link->fs_attribs))
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+      panvk_priv_mem_write_array(link->fs_attribs, 0,
+                                 struct mali_attribute_packed, fs_var_count,
+                                 attrs) {
+         for (unsigned i = 0; i < fs_var_count; i++) {
+            const struct pan_varying_slot *slot =
+               pan_varying_layout_slot_at(&fs->info.varyings.formats, i);
+
+            pan_pack(&attrs[i], ATTRIBUTE, cfg) {
+               cfg.format = gs_constant_format();
+               if (!slot)
+                  continue;
+
+               const gl_varying_slot loc = slot->location;
+               if (BITFIELD64_BIT(loc) & PAN_HARDWARE_VARYING_BITS) {
+                  /* gl_FragCoord and friends: as in link_shaders. */
+                  cfg.buffer_index = varying_buf_id(loc);
+                  cfg.format = varying_format(loc, PIPE_FORMAT_NONE);
+               } else {
+                  const unsigned gs_loc =
+                     loc == VARYING_SLOT_LAYER      ? PAN_GS_LAYER_SLOT
+                     : loc == VARYING_SLOT_VIEWPORT ? PAN_GS_VIEWPORT_SLOT
+                                                    : loc;
+                  const uint32_t offset = pan_gs_out_offset(gsi, gs_loc);
+                  if (offset != PAN_GS_SLOT_UNUSED) {
+                     nir_alu_type base =
+                        nir_alu_type_get_base_type(slot->alu_type);
+                     enum pipe_format pfmt =
+                        pan_varying_format(base | 32, slot->ncomps);
+                     cfg.buffer_index = PANVK_VARY_BUF_GENERAL;
+                     cfg.offset = offset;
+                     cfg.format = GENX(pan_format_from_pipe_format)(pfmt)->hw;
+                  }
+               }
+               cfg.offset_enable = false;
+            }
+         }
+      }
+   }
+
+   return VK_SUCCESS;
+}
+#endif

@@ -263,6 +263,10 @@ shader_ssbo_table(nir_builder *b, unsigned set, unsigned binding,
    case MESA_SHADER_COMPUTE:
       return PANVK_DESC_TABLE_CS_DYN_SSBOS;
    case MESA_SHADER_VERTEX:
+   /* The geometry shader emulation runs as its own job with its own push
+    * uniforms, so it can reuse the vertex shader's table slot.
+    */
+   case MESA_SHADER_GEOMETRY:
       return PANVK_DESC_TABLE_VS_DYN_SSBOS;
    case MESA_SHADER_FRAGMENT:
       return PANVK_DESC_TABLE_FS_DYN_SSBOS;

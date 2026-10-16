@@ -145,6 +145,7 @@ enum panvk_cmd_graphics_dirty_state {
    PANVK_CMD_GRAPHICS_DIRTY_VS_PUSH_UNIFORMS,
    PANVK_CMD_GRAPHICS_DIRTY_FS_PUSH_UNIFORMS,
    PANVK_CMD_GRAPHICS_DIRTY_IDVS,
+   PANVK_CMD_GRAPHICS_DIRTY_GS,
    PANVK_CMD_GRAPHICS_DIRTY_STATE_COUNT,
 };
 
@@ -181,6 +182,17 @@ struct panvk_cmd_graphics_state {
       enum mesa_prim prim;
       bool restart;
    } idvs;
+
+#if PAN_ARCH < 9
+   /* Geometry shader emulation (pan_gs.h). */
+   struct {
+      const struct panvk_shader *shader;
+      struct panvk_shader_desc_state desc;
+      uint64_t push_uniforms;
+      /* Rebuilt when VS, GS or FS changes. */
+      struct panvk_gs_link link;
+   } gs;
+#endif
 
    struct {
       const struct panvk_shader *shader;

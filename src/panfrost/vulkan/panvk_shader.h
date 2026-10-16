@@ -11,6 +11,7 @@
 #endif
 
 #include "compiler/pan_compiler.h"
+#include "compiler/pan_gs.h"
 
 #include "pan_desc.h"
 #include "pan_earlyzs.h"
@@ -175,6 +176,9 @@ struct panvk_graphics_sysvals {
    struct {
       aligned_u64 sets[PANVK_DESC_TABLE_GFX_COUNT];
    } desc;
+
+   /* Geometry shader emulation: address of the draw's struct pan_gs_params. */
+   aligned_u64 gs_params;
 #endif
 } __attribute__((aligned(FAU_WORD_SIZE)));
 
@@ -442,6 +446,14 @@ enum panvk_vs_variant {
    /* Hardware vertex shader, when next stage is fragment */
    PANVK_VS_VARIANT_HW,
 
+#if PAN_ARCH < 9
+   /* Vertex shader feeding the geometry shader emulation (pan_gs.h): no
+    * IDVS, positions left in clip space. Only compiled when the next stage
+    * can be a geometry shader.
+    */
+   PANVK_VS_VARIANT_GS,
+#endif
+
    PANVK_VS_VARIANTS,
 };
 
@@ -449,6 +461,11 @@ struct panvk_shader {
    struct vk_shader vk;
 
    struct panvk_shader_desc_info desc_info;
+
+#if PAN_ARCH < 9
+   /* Geometry shaders: what the draw path needs to run the emulation. */
+   struct pan_gs_info gs;
+#endif
 
    struct panvk_shader_variant variants[];
 };
@@ -464,6 +481,9 @@ panvk_shader_num_variants(mesa_shader_stage stage)
 
 static const char *panvk_vs_shader_variant_name[] = {
    [PANVK_VS_VARIANT_HW] = NULL,
+#if PAN_ARCH < 9
+   [PANVK_VS_VARIANT_GS] = "geometry input",
+#endif
 };
 
 static const char *
@@ -538,6 +558,31 @@ panvk_shader_link_cleanup(struct panvk_shader_link *link)
 {
    panvk_pool_free_mem(&link->vs.attribs);
    panvk_pool_free_mem(&link->fs.attribs);
+}
+
+/* Varying descriptors when a geometry shader is bound (pan_gs.h): the vertex
+ * shader keeps every output in memory for the emulation, which reads them
+ * through in_offsets, and the fragment shader reads the emulation's records.
+ */
+struct panvk_gs_link {
+   struct panvk_priv_mem vs_attribs;
+   struct panvk_priv_mem fs_attribs;
+   /* uint32_t[64]: pan_gs_params::in_offsets */
+   struct panvk_priv_mem in_offsets;
+};
+
+VkResult panvk_per_arch(link_gs_shaders)(struct panvk_pool *desc_pool,
+                                         const struct panvk_shader_variant *vs,
+                                         const struct panvk_shader *gs,
+                                         const struct panvk_shader_variant *fs,
+                                         struct panvk_gs_link *link);
+
+static inline void
+panvk_gs_link_cleanup(struct panvk_gs_link *link)
+{
+   panvk_pool_free_mem(&link->vs_attribs);
+   panvk_pool_free_mem(&link->fs_attribs);
+   panvk_pool_free_mem(&link->in_offsets);
 }
 #endif
 
