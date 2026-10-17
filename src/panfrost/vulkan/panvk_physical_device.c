@@ -384,7 +384,6 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    }
 
    switch (arch) {
-   case 6:
    case 7:
    case 11:
    case 14:
@@ -397,6 +396,7 @@ panvk_physical_device_init(struct panvk_physical_device *device,
       }
       break;
 
+   case 6:
    case 10:
    case 12:
    case 13:
